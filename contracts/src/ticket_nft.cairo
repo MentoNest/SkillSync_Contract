@@ -93,7 +93,7 @@ mod TicketNFT {
                     token_id,
                     event_id
                 }
-            )
+            );
             token_id
         }
 
