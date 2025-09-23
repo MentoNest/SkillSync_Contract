@@ -1,92 +1,80 @@
-# SkillSync Smart Contract
-
-A decentralized smart contract system for managing freelance work agreements and payments using Cairo on StarkNet.
+ SkillSync Smart Contract (Rust / ink!)
+   A decentralized smart contract system for managing freelance work agreements and payments using Rust (ink!) on Substrate smart-contracts-compatible chains.
 
 ## Prerequisites
-
-Before you begin, ensure you have the following installed:
-- Python 3.9 or higher
-- [Cairo Lang](https://www.cairo-lang.org/docs/quickstart.html)
-- [Starknet-devnet](https://github.com/Shard-Labs/starknet-devnet)
-- pip (Python package manager)
+   Before you begin, ensure you have:
+      1. Rust toolchain (stable) + rustup (>= 1.56 recommended)
+      2. cargo and rustc installed
+      3. cargo-contract (for building & deploying ink! contracts)
+      4. substrate-contracts-node or Parity Canvas node for a local dev chain
+      5. wasm32-unknown-unknown target
+      6. cargo-make (optional, for helper tasks)
 
 ## Installation
 
-1. Install Cairo:
-```bash
-curl -L https://raw.githubusercontent.com/starkware-libs/cairo-lang/master/scripts/install.sh | bash
-```
+* Install rustup (if needed)
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   rustup update stable
+   rustup target add wasm32-unknown-unknown
 
-2. Install Python dependencies:
-```bash
-pip install cairo-lang starknet-devnet pytest pytest-asyncio
-```
+* Install cargo-contract (ink! tool)
+   cargo install cargo-contract --vers ^2.0.0
 
-3. Set up your environment:
-```bash
-cp .env.example .env
-# Edit .env with your configuration
-```
+* (Optional) Install cargo-make
+   cargo install cargo-make
+  
+# To run a local dev node:
+   * Get a node for local dev (one-off)
+      git clone https://github.com/paritytech/substrate-contracts-node
+      cd substrate-contracts-node
+      cargo build --release
+   * Run node in a separate terminal:
+      ./target/release/substrate-contracts-node --dev
+
+
 
 ## Project Structure
 
 ```
 contracts/
+├── Cargo.toml           # workspace or contract top-level (if multiple modules)
 ├── src/
-│   ├── modules/        # Modular contract components
-│   └── main.cairo      # Main contract entry point
+│   ├── lib.rs           # main ink! contract entry (SkillSync)
+│   ├── modules/         # modular contract components (separate Rust modules)
+│   │   ├── user.rs
+│   │   ├── escrow.rs
+│   │   ├── reputation.rs
+│   │   └── dispute.rs
+│   └── utils.rs
 ├── tests/
-│   └── test_main.py    # Contract tests
-├── README.md           # This file
-└── .env.example        # Environment configuration template
+│   └── unit_tests.rs    # Rust unit tests (ink! off-chain tests)
+├── README.md            # This file
+└── .env.example         # Environment / deployment template (RPC endpoints, accounts)
+
 ```
 
-## Development
+## Development BUILD & TEST
+   # Build the contract to wasm + metadata
+   cargo +stable contract build
+   
+   # Run unit tests (off-chain/in-memory)
+   cargo test
+   
+   # If using cargo-make, optionally:
+   # cargo make build
 
-### Running Tests
 
-```bash
-pytest contracts/tests/
-```
 
-### Local Development
+### DEPLOYMENT
 
-1. Start local Starknet devnet:
-```bash
-starknet-devnet
-```
+# deploy command (example)
+cargo +stable contract instantiate \
+  --constructor new \
+  --suri "//Alice" \
+  --endowment 1000000000000000 \
+  --salt 0x00 \
+  --manifest-path target/ink/metadata.json \
+  --wasm target/ink/skill_sync.wasm
 
-2. Deploy contract (from project root):
-```bash
-starknet-compile contracts/src/main.cairo
-starknet deploy --contract main_compiled.json
-```
 
-## Current Implementation
 
-The current implementation includes:
-- Basic contract structure
-- "God bless Ezen-wata" placeholder message
-- Test framework setup
-
-## Future Implementation Areas
-
-1. User Management
-   - Registration
-   - Profile management
-   - Reputation system
-
-2. Contract Management
-   - Creation
-   - Validation
-   - State management
-
-3. Payment System
-   - Token integration
-   - Payment processing
-   - Escrow functionality
-
-4. Dispute Resolution
-   - Dispute initiation
-   - Resolution mechanism
-   - Voting system
