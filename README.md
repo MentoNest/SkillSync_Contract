@@ -1,29 +1,50 @@
- SkillSync Smart Contract (Rust / ink!)
-   A decentralized smart contract system for managing freelance work agreements and payments using Rust (ink!) on Substrate smart-contracts-compatible chains.
+## SkillSync Contracts 🔗
+*Soroban smart contracts for the SkillSync platform*
 
-## Prerequisites
-   Before you begin, ensure you have:
-      1. Rust toolchain (stable) + rustup (>= 1.56 recommended)
-      2. cargo and rustc installed
-      3. cargo-contract (for building & deploying ink! contracts)
-      4. substrate-contracts-node or Parity Canvas node for a local dev chain
-      5. wasm32-unknown-unknown target
-      6. cargo-make (optional, for helper tasks)
+## 📌 About
+**SkillSync Contracts** contains the smart contracts that power decentralized mentorship agreements on SkillSync.
 
-## Installation
+These contracts are written using **Soroban** and deployed on the **Stellar network**, enabling trustless escrow, payments, and reputation tracking.
 
-* Install rustup (if needed)
+## ⚙️ Core Contracts
+- Mentorship Escrow Contract
+- Payment Release Logic
+- Reputation & Rating Registry
+- Platform Fee Management
+
+## 🛠 Tech Stack
+
+- Rust
+- Soroban SDK
+- Stellar CLI
+
+## ⚙️ Setup & Deployment
+
+### Prerequisites
+- Rust
+- Soroban CLI
+- Stellar Testnet Account
+
+### Build Contracts
+```bash
+soroban contract build
+```
+### Installation
+* Install rustup
+* ```
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    rustup update stable
    rustup target add wasm32-unknown-unknown
 
 * Install cargo-contract (ink! tool)
+* ```
    cargo install cargo-contract --vers ^2.0.0
 
 * (Optional) Install cargo-make
    cargo install cargo-make
   
 # To run a local dev node:
+```
    * Get a node for local dev (one-off)
       git clone https://github.com/paritytech/substrate-contracts-node
       cd substrate-contracts-node
@@ -31,7 +52,7 @@
    * Run node in a separate terminal:
       ./target/release/substrate-contracts-node --dev
 
-
+````
 
 ## Project Structure
 
