@@ -74,21 +74,14 @@ contracts/
 
 ```
 
-## Development BUILD & TEST
-   # Build the contract to wasm + metadata
-   cargo +stable contract build
-   
-   # Run unit tests (off-chain/in-memory)
-   cargo test
-   
-   # If using cargo-make, optionally:
-   # cargo make build
 
 
 
-### DEPLOYMENT
+
+## DEPLOYMENT
 
 # deploy command (example)
+```
 cargo +stable contract instantiate \
   --constructor new \
   --suri "//Alice" \
