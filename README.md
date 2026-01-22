@@ -22,12 +22,12 @@ These contracts are written using **Soroban** and deployed on the **Stellar netw
 
 ### Prerequisites
 - Rust
-- Soroban CLI
+- Stellar CLI
 - Stellar Testnet Account
 
 ### Build Contracts
 ```bash
-soroban contract build
+stellar contract build
 ```
 ### Installation
 * Install rustup
