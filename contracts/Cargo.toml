@@ -3,6 +3,10 @@ members = [
     "session_gate",
     "dispute",
 ]
+exclude = [
+    "fee_split",
+    "withdrawal",
+]
 resolver = "2"
 
 [profile.release]
