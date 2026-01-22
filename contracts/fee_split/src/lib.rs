@@ -44,7 +44,7 @@ pub enum Error {
 pub struct FeeSplitContract;
 
 impl FeeSplitContract {
-    /// Load the admin address or panic if the contract is not initialized.
+    /// Load the admin address or panic if the contract is not initialize.
     fn read_admin(env: &Env) -> Address {
         env.storage()
             .instance()
