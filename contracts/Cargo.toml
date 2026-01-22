@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "session_gate",
+    "dispute",
 ]
 exclude = [
     "fee_split",
