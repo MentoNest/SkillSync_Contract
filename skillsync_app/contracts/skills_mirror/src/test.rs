@@ -113,17 +113,17 @@ fn test_rename_nonexistent_skill() {
 }
 
 #[test]
-#[should_panic(expected = "Not authorized")]
+#[should_panic(expected = "Unauthorized function call for address")]
 fn test_unauthorized_mutation() {
     let env = Env::default();
 
     let admin = Address::generate(&env);
-    let user = Address::generate(&env);
+    let _user = Address::generate(&env);  // fixed warning
 
     let contract_id = env.register_contract(None, SkillsTaxonomy);
     let client = SkillsTaxonomyClient::new(&env, &contract_id);
 
-    // We only mock auth for the *admin* calling initialize
+    // Mock auth only for admin on initialize (so init succeeds)
     env.mock_auths(&[
         MockAuth {
             address: &admin,
@@ -138,7 +138,7 @@ fn test_unauthorized_mutation() {
 
     client.initialize(&admin);
 
-    // No auth mocked for add_skill → should panic on admin.require_auth()
+    // No mock_auth for add_skill → admin.require_auth() should fail → panic
     client.add_skill(
         &symbol_short!("go"),
         &String::from_str(&env, "Go Programming"),
