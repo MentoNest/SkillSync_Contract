@@ -1,7 +1,8 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::{Address as _, MockAuth, MockAuthInvoke}, Address, Env, String};
+use soroban_sdk::{testutils::{Address as _, MockAuth, MockAuthInvoke}, Address, Env, String, IntoVal};
+
 
 #[test]
 fn test_skill_lifecycle() {
@@ -122,6 +123,7 @@ fn test_unauthorized_mutation() {
     let contract_id = env.register_contract(None, SkillsTaxonomy);
     let client = SkillsTaxonomyClient::new(&env, &contract_id);
 
+    // We only mock auth for the *admin* calling initialize
     env.mock_auths(&[
         MockAuth {
             address: &admin,
@@ -129,12 +131,14 @@ fn test_unauthorized_mutation() {
                 contract: &contract_id,
                 fn_name: "initialize",
                 args: (&admin,).into_val(&env),
+                sub_invokes: &[],
             },
         },
     ]);
 
     client.initialize(&admin);
 
+    // No auth mocked for add_skill → should panic on admin.require_auth()
     client.add_skill(
         &symbol_short!("go"),
         &String::from_str(&env, "Go Programming"),
