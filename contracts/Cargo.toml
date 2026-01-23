@@ -3,6 +3,7 @@ members = [
     "session_gate",
     "dispute",
     "skills_mirror",
+    "stake",
 ]
 exclude = [
     "fee_split",
