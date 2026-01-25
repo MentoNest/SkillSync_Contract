@@ -5,6 +5,7 @@ members = [
     "skills_mirror",
     "stake",
     "release_auth",
+    "reputation",
 ]
 exclude = [
     "fee_split",
