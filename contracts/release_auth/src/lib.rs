@@ -1,9 +1,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use ink::storage::Mapping;
+use common_events::schemas;
+use ink::storage::Mapping; // Integrated common schema library
 
 /// Payment Release Authorization Contract for SkillSync
-/// 
+///
 /// Validates release authorization via signatures from approved signers (backend or admin).
 /// Implements replay protection via nonce tracking and manages authorized signers list.
 #[ink::contract]
@@ -85,7 +86,7 @@ mod release_auth {
 
     impl ReleaseAuth {
         /// Creates a new ReleaseAuth contract
-        /// 
+        ///
         /// # Arguments
         /// * `admin` - The admin account that can manage signer list
         #[ink(constructor)]
@@ -99,10 +100,10 @@ mod release_auth {
         }
 
         /// Adds a new authorized signer to the list (admin only)
-        /// 
+        ///
         /// # Arguments
         /// * `pubkey` - The 32-byte public key to authorize
-        /// 
+        ///
         /// # Emits
         /// * `SignerAdded` event
         #[ink(message)]
@@ -124,10 +125,10 @@ mod release_auth {
         }
 
         /// Removes an authorized signer from the list (admin only)
-        /// 
+        ///
         /// # Arguments
         /// * `pubkey` - The 32-byte public key to remove
-        /// 
+        ///
         /// # Emits
         /// * `SignerRemoved` event
         #[ink(message)]
@@ -149,13 +150,13 @@ mod release_auth {
         }
 
         /// Authorizes a release by verifying the signature against the payload
-        /// 
+        ///
         /// This is a simplified signature verification. In production, this would:
         /// 1. Hash the payload
         /// 2. Recover the signer's public key from the signature
         /// 3. Check if the recovered key is in the authorized signers list
         /// 4. Verify the nonce hasn't been used before
-        /// 
+        ///
         /// # Arguments
         /// * `booking_id` - The booking ID from the payload
         /// * `mentee` - The mentee account from the payload
@@ -164,11 +165,11 @@ mod release_auth {
         /// * `token` - The token address from the payload
         /// * `nonce` - The nonce from the payload
         /// * `signature` - The 65-byte signature (r || s || v format)
-        /// 
+        ///
         /// # Returns
         /// * `true` if signature is valid and not a replay
         /// * `false` if signature is invalid
-        /// 
+        ///
         /// # Emits
         /// * `ReleaseAuthorized` event on successful verification
         #[ink(message)]
@@ -224,10 +225,10 @@ mod release_auth {
         }
 
         /// Checks if a nonce has already been used (replay prevention check)
-        /// 
+        ///
         /// # Arguments
         /// * `nonce` - The nonce to check
-        /// 
+        ///
         /// # Returns
         /// * `true` if nonce has been used
         /// * `false` if nonce is available
@@ -237,10 +238,10 @@ mod release_auth {
         }
 
         /// Checks if a signer is authorized
-        /// 
+        ///
         /// # Arguments
         /// * `pubkey` - The 32-byte public key to check
-        /// 
+        ///
         /// # Returns
         /// * `true` if signer is authorized
         /// * `false` otherwise
@@ -262,7 +263,7 @@ mod release_auth {
         }
 
         /// Transfers admin rights to a new account (admin only)
-        /// 
+        ///
         /// # Arguments
         /// * `new_admin` - The new admin account
         #[ink(message)]
@@ -276,12 +277,12 @@ mod release_auth {
         }
 
         /// Internal helper to recover signer from signature and payload hash
-        /// 
+        ///
         /// This is a simplified implementation. In production, this would:
         /// 1. Use proper ECDSA recovery (secp256k1 or Ed25519)
         /// 2. Convert the signature format correctly
         /// 3. Return the recovered public key
-        /// 
+        ///
         /// For testing purposes, we use a deterministic derivation
         fn recover_signer(
             &self,
@@ -515,27 +516,13 @@ mod release_auth {
             let signature = create_signature_from_pubkey(pubkey);
 
             // First authorization with nonce 1
-            let result1 = contract.authorize(
-                100,
-                accounts.bob,
-                accounts.alice,
-                1000,
-                token,
-                1,
-                signature,
-            );
+            let result1 =
+                contract.authorize(100, accounts.bob, accounts.alice, 1000, token, 1, signature);
             assert!(result1.is_ok());
 
             // Second authorization with nonce 2 succeeds
-            let result2 = contract.authorize(
-                100,
-                accounts.bob,
-                accounts.alice,
-                1000,
-                token,
-                2,
-                signature,
-            );
+            let result2 =
+                contract.authorize(100, accounts.bob, accounts.alice, 1000, token, 2, signature);
             assert!(result2.is_ok());
         }
 
@@ -554,7 +541,15 @@ mod release_auth {
             let signature = create_signature_from_pubkey(pubkey);
 
             contract
-                .authorize(50, accounts.bob, accounts.alice, 1000, token, 100, signature)
+                .authorize(
+                    50,
+                    accounts.bob,
+                    accounts.alice,
+                    1000,
+                    token,
+                    100,
+                    signature,
+                )
                 .ok();
 
             assert!(contract.is_nonce_used(100));
