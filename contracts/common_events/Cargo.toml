@@ -1,13 +1,13 @@
 [package]
-name = "release_auth"
+name = "common_events"
 version = "0.1.0"
+authors = ["SkillSync Team"]
 edition = "2021"
 
 [dependencies]
-ink = { version = "5.0.0", default-features = false }
+ink = { version = "4.2.0", default-features = false }
 scale = { package = "parity-scale-codec", version = "3", default-features = false, features = ["derive"] }
-scale-info = { version = "2.6", default-features = false, features = ["derive"] }
-common_events = { path = "../common_events", default-features = false }
+scale-info = { version = "2.6", default-features = false, features = ["derive"], optional = true }
 
 [lib]
 path = "src/lib.rs"
@@ -18,6 +18,5 @@ std = [
     "ink/std",
     "scale/std",
     "scale-info/std",
-    "common_events/std",
 ]
 ink-as-dependency = []

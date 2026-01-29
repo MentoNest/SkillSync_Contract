@@ -6,6 +6,7 @@ members = [
     "stake",
     "release_auth",
     "reputation",
+    "common_events",
 ]
 exclude = [
     "fee_split",
