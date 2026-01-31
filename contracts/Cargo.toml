@@ -7,6 +7,7 @@ members = [
     "release_auth",
     "reputation",
     "common_events",
+    "audit_log",
 ]
 exclude = [
     "fee_split",
