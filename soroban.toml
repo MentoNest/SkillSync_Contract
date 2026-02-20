@@ -1,0 +1,28 @@
+# Soroban Multi-Network Configuration
+# 
+# This file defines network profiles for deploying SkillSync contracts.
+# Networks can be selected via SOROBAN_NETWORK environment variable.
+#
+# See SOROBAN.md for complete documentation on network management.
+
+[profile.testnet]
+network = "testnet"
+rpc_url = "https://soroban-testnet.stellar.org"
+network_passphrase = "Test SDF Network ; September 2015"
+description = "Stellar Testnet - for testing before mainnet deployment"
+
+[profile.mainnet]
+network = "mainnet"
+rpc_url = "https://mainnet.sorobanrpc.com"
+network_passphrase = "Public Global Stellar Network ; September 2015"
+description = "Stellar Mainnet - production network"
+
+[profile.sandbox]
+network = "sandbox"
+rpc_url = "http://localhost:8000"
+network_passphrase = "Standalone Network ; February 2017"
+description = "Local Soroban sandbox - for local development"
+
+# Default profile to use if SOROBAN_NETWORK is not set
+[default]
+network = "testnet"
