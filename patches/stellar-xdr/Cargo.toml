@@ -1,0 +1,21 @@
+[package]
+name = "stellar-xdr"
+version = "20.1.0"
+edition = "2021"
+authors = ["local-patch"]
+description = "Local stub of stellar-xdr for workspace patching"
+
+[lib]
+name = "stellar_xdr"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+
+[features]
+default = []
+curr = []
+std = []
+base64 = []
+serde = []
+arbitrary = []

@@ -1,37 +1,23 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Env, Symbol};
+use soroban_sdk::{Address, Env};
 
-#[contract]
-pub struct SkillSyncContract;
+pub fn init(env: Env, admin: Address) {
+    let _ = (env, admin);
+}
 
-#[contractimpl]
-impl SkillSyncContract {
-    /// Initialize the contract
-    pub fn initialize(env: Env, admin: soroban_sdk::Address) {
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "admin"), &admin);
-    }
-
-    /// Get the admin address
-    pub fn get_admin(env: Env) -> Option<soroban_sdk::Address> {
-        env.storage().instance().get(&Symbol::new(&env, "admin"))
-    }
+pub fn ping(env: Env) -> u32 {
+    let _ = env;
+    1
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as TestAddress, Address};
 
     #[test]
-    fn test_initialize() {
-        let env = soroban_sdk::Env::default();
-        let admin = Address::generate(&env);
-
-        SkillSyncContract::initialize(env.clone(), admin.clone());
-
-        assert_eq!(SkillSyncContract::get_admin(env), Some(admin));
+    fn test_ping() {
+        let env = Env::default();
+        assert_eq!(ping(env), 1);
     }
 }
