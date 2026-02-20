@@ -179,10 +179,7 @@ impl Config {
                 // Try to get from soroban.toml default
                 Self::load_toml()
                     .ok()
-                    .and_then(|toml| {
-                        toml.default
-                            .and_then(|d| d.network)
-                    })
+                    .and_then(|toml| toml.default.and_then(|d| d.network))
             })
             .unwrap_or_else(|| "testnet".to_string());
 
@@ -232,10 +229,7 @@ impl Config {
 
     /// Load soroban.toml from workspace root
     fn load_toml() -> Result<SorobanToml, ConfigError> {
-        let paths = [
-            Path::new("soroban.toml"),
-            Path::new("./soroban.toml"),
-        ];
+        let paths = [Path::new("soroban.toml"), Path::new("./soroban.toml")];
 
         for path in paths {
             if path.exists() {
@@ -248,11 +242,7 @@ impl Config {
     }
 
     /// Validate configuration values
-    fn validate(
-        _network: &Network,
-        rpc_url: &str,
-        passphrase: &str,
-    ) -> Result<(), ConfigError> {
+    fn validate(_network: &Network, rpc_url: &str, passphrase: &str) -> Result<(), ConfigError> {
         if rpc_url.is_empty() {
             return Err(ConfigError::MissingField("rpc_url".to_string()));
         }
@@ -263,9 +253,10 @@ impl Config {
 
         // Validate RPC URL format
         if !rpc_url.starts_with("http://") && !rpc_url.starts_with("https://") {
-            return Err(ConfigError::ValidationError(
-                format!("RPC URL must start with http:// or https://: {}", rpc_url),
-            ));
+            return Err(ConfigError::ValidationError(format!(
+                "RPC URL must start with http:// or https://: {}",
+                rpc_url
+            )));
         }
 
         Ok(())
@@ -344,10 +335,7 @@ mod tests {
         assert_eq!(Network::from_str("testnet").unwrap(), Network::Testnet);
         assert_eq!(Network::from_str("mainnet").unwrap(), Network::Mainnet);
         assert_eq!(Network::from_str("sandbox").unwrap(), Network::Sandbox);
-        assert_eq!(
-            Network::from_str("TESTNET").unwrap(),
-            Network::Testnet
-        );
+        assert_eq!(Network::from_str("TESTNET").unwrap(), Network::Testnet);
     }
 
     #[test]
@@ -372,10 +360,7 @@ mod tests {
             Network::Mainnet.default_rpc_url(),
             "https://mainnet.sorobanrpc.com"
         );
-        assert_eq!(
-            Network::Sandbox.default_rpc_url(),
-            "http://localhost:8000"
-        );
+        assert_eq!(Network::Sandbox.default_rpc_url(), "http://localhost:8000");
     }
 
     #[test]
@@ -408,8 +393,11 @@ mod tests {
 
     #[test]
     fn test_validate_invalid_rpc_url() {
-        let result =
-            Config::validate(&Network::Testnet, "ftp://example.com", "Test SDF Network ; September 2015");
+        let result = Config::validate(
+            &Network::Testnet,
+            "ftp://example.com",
+            "Test SDF Network ; September 2015",
+        );
         assert!(result.is_err());
     }
 

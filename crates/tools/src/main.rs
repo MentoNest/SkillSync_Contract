@@ -58,33 +58,31 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Network { action } => {
-            match action {
-                Some(NetworkAction::Show) => {
-                    let config = Config::load()?;
-                    config.print_summary();
-                    Ok(())
-                }
-                Some(NetworkAction::List) => {
-                    println!("╔════════════════════════════════════════════════════════════════╗");
-                    println!("║            AVAILABLE SOROBAN NETWORKS                          ║");
-                    println!("╚════════════════════════════════════════════════════════════════╝");
-                    println!("  testnet   - Stellar Testnet (for testing)");
-                    println!("  mainnet   - Stellar Mainnet (production)");
-                    println!("  sandbox   - Local Soroban Sandbox (localhost:8000)");
-                    println!();
-                    println!("To select a network:");
-                    println!("  export SOROBAN_NETWORK=testnet");
-                    println!("  cargo run -p skillsync-tools -- network show");
-                    Ok(())
-                }
-                None => {
-                    let config = Config::load()?;
-                    config.print_summary();
-                    Ok(())
-                }
+        Commands::Network { action } => match action {
+            Some(NetworkAction::Show) => {
+                let config = Config::load()?;
+                config.print_summary();
+                Ok(())
             }
-        }
+            Some(NetworkAction::List) => {
+                println!("╔════════════════════════════════════════════════════════════════╗");
+                println!("║            AVAILABLE SOROBAN NETWORKS                          ║");
+                println!("╚════════════════════════════════════════════════════════════════╝");
+                println!("  testnet   - Stellar Testnet (for testing)");
+                println!("  mainnet   - Stellar Mainnet (production)");
+                println!("  sandbox   - Local Soroban Sandbox (localhost:8000)");
+                println!();
+                println!("To select a network:");
+                println!("  export SOROBAN_NETWORK=testnet");
+                println!("  cargo run -p skillsync-tools -- network show");
+                Ok(())
+            }
+            None => {
+                let config = Config::load()?;
+                config.print_summary();
+                Ok(())
+            }
+        },
         Commands::Deploy { network, wasm } => {
             let config = match network {
                 Some(net) => {
