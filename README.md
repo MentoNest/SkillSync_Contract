@@ -19,6 +19,91 @@ These contracts are written using **Soroban** and deployed on the **Stellar netw
 - Soroban SDK
 - Stellar CLI
 
+## ⚙️ Developer Environment Setup
+
+### Quick Start (Recommended)
+```bash
+# Install all dependencies automatically
+make install-deps
+
+# Verify installation
+make check-deps
+
+# Build the project
+make wasm
+```
+
+### Manual Setup
+
+#### 1. Install Rust Toolchain
+The project uses `rust-toolchain.toml` to pin the stable Rust version and required components:
+
+```bash
+# Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# The project will automatically use the pinned toolchain
+rustup toolchain install stable
+rustup target add wasm32-unknown-unknown
+rustup component add rustfmt clippy
+```
+
+#### 2. Install Soroban CLI
+```bash
+# Install Soroban CLI via cargo
+cargo install soroban-cli
+
+# Verify installation
+soroban --version
+```
+
+#### 3. Verify Setup
+```bash
+# Check all dependencies are installed
+make check-deps
+
+# Test build
+make wasm
+```
+
+### Development Commands
+
+The project includes a Makefile with common development tasks:
+
+```bash
+# Install all dependencies
+make install-deps
+
+# Check if dependencies are installed
+make check-deps
+
+# Build all workspace members
+make build
+
+# Build contract for WASM target
+make wasm
+
+# Run all tests
+make test
+
+# Format code
+make fmt
+
+# Run lints
+make lint
+
+# Clean build artifacts
+make clean
+
+# Show help
+make help
+```
+
+### Prerequisites
+- Rust (automatically managed by rust-toolchain.toml)
+- Soroban CLI (installed via make install-deps)
+- Make (for using the Makefile commands)
+
 ## ⚙️ Setup & Deployment
 
 ### Prerequisites
@@ -28,14 +113,14 @@ These contracts are written using **Soroban** and deployed on the **Stellar netw
 
 ### Build Contracts
 ```bash
-# Add WASM target (one-time setup)
-rustup target add wasm32-unknown-unknown
+# Quick build using Makefile (recommended)
+make wasm
 
-# Build the core contract for WASM
+# Or use cargo directly
 cargo build -p skillsync-core --target wasm32-unknown-unknown --release
 
 # Build all workspace members
-cargo build --release
+make build
 
 # Build CLI tools only
 cargo build -p skillsync-tools --release
@@ -82,6 +167,8 @@ cargo run -p skillsync-tools -- build --profile release
 ```
 SkillSync_Contract/
 ├── Cargo.toml              # Workspace configuration
+├── rust-toolchain.toml     # Pinned Rust toolchain and targets
+├── Makefile                # Development automation commands
 ├── README.md               # This file
 ├── .gitignore              # Git ignore patterns
 ├── crates/
