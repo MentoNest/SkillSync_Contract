@@ -9,7 +9,9 @@ pub struct SkillSyncContract;
 impl SkillSyncContract {
     /// Initialize the contract
     pub fn initialize(env: Env, admin: soroban_sdk::Address) {
-        env.storage().instance().set(&Symbol::new(&env, "admin"), &admin);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "admin"), &admin);
     }
 
     /// Get the admin address
@@ -21,15 +23,15 @@ impl SkillSyncContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{Address, testutils::Address as TestAddress};
+    use soroban_sdk::{testutils::Address as TestAddress, Address};
 
     #[test]
     fn test_initialize() {
         let env = soroban_sdk::Env::default();
         let admin = Address::generate(&env);
-        
+
         SkillSyncContract::initialize(env.clone(), admin.clone());
-        
+
         assert_eq!(SkillSyncContract::get_admin(env), Some(admin));
     }
 }

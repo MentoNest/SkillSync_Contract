@@ -1,6 +1,8 @@
 ## SkillSync Contracts 🔗
 *Soroban smart contracts for the SkillSync platform*
 
+![CI](https://github.com/LaGodxy/SkillSync_Contract/workflows/CI/badge.svg)
+
 ## 📌 About
 **SkillSync Contracts** contains the smart contracts that power decentralized mentorship agreements on SkillSync.
 
@@ -13,7 +15,19 @@ These contracts are written using **Soroban** and deployed on the **Stellar netw
 - Platform Fee Management
 - Session Completion Gate
 
-## 🛠 Tech Stack
+## � CI/CD
+
+This project uses GitHub Actions for continuous integration. The CI pipeline runs on every push and pull request to the `main` branch and includes:
+
+- **Code formatting check** (`cargo fmt --all -- --check`)
+- **Linting** (`cargo clippy --all-targets --all-features -- -D warnings`)
+- **Testing** (`cargo test --all --locked`)
+- **Native build** (`cargo build --release --locked`)
+- **WASM build** (`cargo build -p skillsync-core --target wasm32-unknown-unknown --release --locked`)
+
+The CI status is displayed in the badge at the top of this README. Failing formatting, linting, or tests will block merges.
+
+## �🛠 Tech Stack
 
 - Rust
 - Soroban SDK
@@ -166,6 +180,9 @@ cargo run -p skillsync-tools -- build --profile release
 
 ```
 SkillSync_Contract/
+├── .github/
+│   └── workflows/
+│       └── ci.yml          # GitHub Actions CI configuration
 ├── Cargo.toml              # Workspace configuration
 ├── rust-toolchain.toml     # Pinned Rust toolchain and targets
 ├── Makefile                # Development automation commands
