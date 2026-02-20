@@ -1,7 +1,7 @@
 # Rust
 /target/
-Cargo.lock
 **/*.rs.bk
+Cargo.lock
 
 # IDE
 .vscode/
@@ -12,35 +12,41 @@ Cargo.lock
 
 # OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-# Contract build artifacts
-contracts/target/
-**/*.wasm
-**/*.wasm.gz
-**/metadata.json
-**/contract.bundle
-
-# Environment files
+# Environment variables
 .env
 .env.local
-.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# WASM
+*.wasm
+*.wasm.gz
+
+# Soroban/Stellar
+stellar.toml
+*.json
 
 # Logs
 *.log
 logs/
 
 # Temporary files
-*.tmp
-*.temp
+tmp/
+temp/
 
-# Node modules (if any frontend integration)
-node_modules/
+# Build artifacts
+/target/wasm32-unknown-unknown/
+/target/release/
+/target/debug/
 
-# Test coverage
+# Test outputs
+test-results/
 coverage/
-*.lcov
-
-# Backup files
-*.bak
-*.backup

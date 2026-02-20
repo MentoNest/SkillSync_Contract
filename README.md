@@ -28,7 +28,29 @@ These contracts are written using **Soroban** and deployed on the **Stellar netw
 
 ### Build Contracts
 ```bash
-stellar contract build
+# Add WASM target (one-time setup)
+rustup target add wasm32-unknown-unknown
+
+# Build the core contract for WASM
+cargo build -p skillsync-core --target wasm32-unknown-unknown --release
+
+# Build all workspace members
+cargo build --release
+
+# Build CLI tools only
+cargo build -p skillsync-tools --release
+```
+
+### Run CLI Tools
+```bash
+# Deploy contract
+cargo run -p skillsync-tools -- deploy --network testnet -- wasm target/wasm32-unknown-unknown/release/skillsync_core.wasm
+
+# Check configuration
+cargo run -p skillsync-tools -- config --validate
+
+# Build contracts via CLI
+cargo run -p skillsync-tools -- build --profile release
 ```
 ### Installation
 * Install rustup
@@ -58,28 +80,28 @@ stellar contract build
 ## Project Structure
 
 ```
-contracts/
-├── session_gate/           # Session completion gate contract
-│   ├── src/
-│   │   └── lib.rs          # SessionGate contract implementation
-│   ├── Cargo.toml          # Contract dependencies
-│   ├── README.md           # Contract documentation
-│   └── .env.example        # Environment configuration template
-├── Cargo.toml              # workspace or contract top-level (if multiple modules)
-├── src/
-│   ├── lib.rs              # main ink! contract entry (SkillSync)
-│   ├── modules/            # modular contract components (separate Rust modules)
-│   │   ├── user.rs
-│   │   ├── escrow.rs
-│   │   ├── reputation.rs
-│   │   └── dispute.rs
-│   └── utils.rs
-├── tests/
-│   └── unit_tests.rs       # Rust unit tests (ink! off-chain tests)
+SkillSync_Contract/
+├── Cargo.toml              # Workspace configuration
 ├── README.md               # This file
-└── .env.example            # Environment / deployment template (RPC endpoints, accounts)
-
+├── .gitignore              # Git ignore patterns
+├── crates/
+│   ├── contracts/
+│   │   └── core/           # Core Soroban contract library
+│   │       ├── Cargo.toml  # Contract dependencies
+│   │       └── src/
+│   │           └── lib.rs  # Main contract implementation
+│   └── tools/              # CLI utilities
+│       ├── Cargo.toml      # Tools dependencies
+│       └── src/
+│           └── main.rs     # CLI entry point
+└── target/                 # Build artifacts (gitignored)
 ```
+
+## Workspace Layout
+
+This is a Cargo workspace containing:
+- **crates/contracts/core**: Main Soroban smart contract library
+- **crates/tools**: CLI utilities for deployment and configuration management
 
 
 
