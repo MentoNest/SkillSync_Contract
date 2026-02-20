@@ -1,0 +1,204 @@
+name: Release WASM Artifacts
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-verify:
+    name: Build, Optimize and Verify
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/contracts/core
+
+      - name: Install WASM optimization tools
+        run: |
+          set -euo pipefail
+          cargo install wasm-opt
+          cargo install wasm-tools
+
+      - name: Build WASM artifact
+        run: |
+          set -euo pipefail
+          export CARGO_INCREMENTAL=0
+          export RUSTFLAGS="-C embed-bitcode=no"
+          cargo build -p skillsync-core \
+            --target wasm32-unknown-unknown \
+            --release \
+            --locked
+        
+      - name: Strip WASM binary
+        run: |
+          set -euo pipefail
+          wasm-tools strip \
+            target/wasm32-unknown-unknown/release/skillsync_core.wasm \
+            -o target/wasm32-unknown-unknown/release/skillsync_core_stripped.wasm
+          mv target/wasm32-unknown-unknown/release/skillsync_core_stripped.wasm \
+             target/wasm32-unknown-unknown/release/skillsync_core.wasm
+
+      - name: Optimize WASM with wasm-opt
+        run: |
+          set -euo pipefail
+          wasm-opt -Oz \
+            target/wasm32-unknown-unknown/release/skillsync_core.wasm \
+            -o target/wasm32-unknown-unknown/release/skillsync_core_opt.wasm
+          mv target/wasm32-unknown-unknown/release/skillsync_core_opt.wasm \
+             target/wasm32-unknown-unknown/release/skillsync_core.wasm
+
+      - name: Generate SHA256 checksums
+        run: |
+          set -euo pipefail
+          cd target/wasm32-unknown-unknown/release
+          sha256sum skillsync_core.wasm > checksums.txt
+          cat checksums.txt
+
+      - name: Create release artifact directory
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          cp target/wasm32-unknown-unknown/release/skillsync_core.wasm \
+             release-artifacts/core-${{ github.ref_name }}.wasm
+          cp target/wasm32-unknown-unknown/release/checksums.txt \
+             release-artifacts/checksums.txt
+
+      - name: Display artifact information
+        run: |
+          set -euo pipefail
+          echo "=== Release Artifacts ==="
+          find release-artifacts -type f -exec ls -lh {} \;
+          echo ""
+          echo "=== Checksum Verification ==="
+          cat release-artifacts/checksums.txt
+
+      - name: Store first checksum for verification
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          sha256sum core-${{ github.ref_name }}.wasm > first-checksum.txt
+          cat first-checksum.txt
+
+      - name: Verify build reproducibility
+        run: |
+          set -euo pipefail
+          # Clean build artifacts but keep source
+          rm -rf target/wasm32-unknown-unknown/release/skillsync_core.wasm
+          
+          # Rebuild from scratch
+          export CARGO_INCREMENTAL=0
+          export RUSTFLAGS="-C embed-bitcode=no"
+          cargo build -p skillsync-core \
+            --target wasm32-unknown-unknown \
+            --release \
+            --locked
+          
+          # Strip again
+          wasm-tools strip \
+            target/wasm32-unknown-unknown/release/skillsync_core.wasm \
+            -o target/wasm32-unknown-unknown/release/skillsync_core_stripped.wasm
+          mv target/wasm32-unknown-unknown/release/skillsync_core_stripped.wasm \
+             target/wasm32-unknown-unknown/release/skillsync_core.wasm
+          
+          # Optimize again
+          wasm-opt -Oz \
+            target/wasm32-unknown-unknown/release/skillsync_core.wasm \
+            -o target/wasm32-unknown-unknown/release/skillsync_core_opt.wasm
+          mv target/wasm32-unknown-unknown/release/skillsync_core_opt.wasm \
+             target/wasm32-unknown-unknown/release/skillsync_core.wasm
+          
+          # Verify checkpoint
+          echo "=== Verification Build Complete ==="
+
+      - name: Verify artifact integrity
+        run: |
+          set -euo pipefail
+          cd target/wasm32-unknown-unknown/release
+          
+          # Compute fresh checksum
+          sha256sum skillsync_core.wasm > fresh-checksum.txt
+          cat fresh-checksum.txt
+          
+          # Extract hash from first build
+          FIRST_HASH=$(head -c 64 release-artifacts/first-checksum.txt)
+          SECOND_HASH=$(head -c 64 fresh-checksum.txt)
+          
+          echo ""
+          echo "First build hash:   $FIRST_HASH"
+          echo "Verification hash:  $SECOND_HASH"
+          echo ""
+          
+          if [ "$FIRST_HASH" != "$SECOND_HASH" ]; then
+            echo "ERROR: Build is NOT reproducible!"
+            echo "First build:  $(cat ../../release-artifacts/first-checksum.txt)"
+            echo "Second build: $(cat fresh-checksum.txt)"
+            exit 1
+          else
+            echo "✓ BUILD REPRODUCIBILITY VERIFIED"
+          fi
+
+      - name: Upload artifacts to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            release-artifacts/core-${{ github.ref_name }}.wasm
+            release-artifacts/checksums.txt
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-release-notes:
+    name: Publish Release Notes
+    needs: build-and-verify
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.ref_name }}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release summary
+        run: |
+          set -euo pipefail
+          echo "## Release ${{ steps.version.outputs.version }}" > /tmp/release-summary.md
+          echo "" >> /tmp/release-summary.md
+          echo "### Build Information" >> /tmp/release-summary.md
+          echo "- **Build Date**: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> /tmp/release-summary.md
+          echo "- **Git Commit**: \`${{ github.sha }}\`" >> /tmp/release-summary.md
+          echo "- **Rust Toolchain**: Stable (wasm32-unknown-unknown)" >> /tmp/release-summary.md
+          echo "- **Build Type**: Release (--release)" >> /tmp/release-summary.md
+          echo "" >> /tmp/release-summary.md
+          echo "### Verification" >> /tmp/release-summary.md
+          echo "To verify artifacts locally:" >> /tmp/release-summary.md
+          echo "\`\`\`bash" >> /tmp/release-summary.md
+          echo "sha256sum -c checksums.txt" >> /tmp/release-summary.md
+          echo "\`\`\`" >> /tmp/release-summary.md
+          echo "" >> /tmp/release-summary.md
+          echo "### Reproducibility" >> /tmp/release-summary.md
+          echo "This release was built with reproducible build settings. See [RELEASE.md](./RELEASE.md) for instructions to reproduce the build locally." >> /tmp/release-summary.md
+          cat /tmp/release-summary.md
