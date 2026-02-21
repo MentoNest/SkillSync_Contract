@@ -197,6 +197,26 @@ mod tests {
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client.init(&admin);
+
+        let old = DEFAULT_DISPUTE_WINDOW_SECONDS;
+        let new = 600_u64;
+        client.set_dispute_window(&new);
+
+        assert_eq!(
+            env.events().all(),
+            vec![
+                &env,
+                (
+                    contract_id,
+                    (Symbol::new(&env, "DisputeWindowUpdated"),).into_val(&env),
+                    (old, new).into_val(&env)
+                )
+            ]
+        );
+    }
 
     #[test]
     fn test_get_and_set_treasury_persists() {
@@ -256,26 +276,6 @@ mod tests {
                 (
                     contract_id,
                     (Symbol::new(&env, "TreasuryUpdated"),).into_val(&env),
-                    (old, new).into_val(&env)
-                )
-            ]
-        );
-    }
-        let admin = Address::generate(&env);
-
-        client.init(&admin);
-
-        let old = DEFAULT_DISPUTE_WINDOW_SECONDS;
-        let new = 600_u64;
-        client.set_dispute_window(&new);
-
-        assert_eq!(
-            env.events().all(),
-            vec![
-                &env,
-                (
-                    contract_id,
-                    (Symbol::new(&env, "DisputeWindowUpdated"),).into_val(&env),
                     (old, new).into_val(&env)
                 )
             ]
