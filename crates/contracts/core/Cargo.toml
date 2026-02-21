@@ -1,5 +1,5 @@
 [package]
-name = "skillsync-core"
+name = "core"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,4 +10,4 @@ crate-type = ["cdylib"]
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
+soroban-sdk = { workspace = true }
