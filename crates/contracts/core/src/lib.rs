@@ -33,6 +33,18 @@ pub enum SessionStatus {
 #[contracttype]
 #[derive(Clone)]
 pub struct Session {
+    // Version field for forward/backward compatibility.
+    // - When adding/removing fields, increment `version` and provide
+    //   migration helpers that can decode older versions and upgrade them.
+    // - Keep changes additive where possible (append-only) to allow
+    //   older contract binaries to safely decode newer data when feasible.
+    // Migration path:
+    // 1. Read stored `Session` and inspect `version`.
+    // 2. If `version` is older, run migration logic to populate new fields
+    //    with sensible defaults and re-save with the new `version`.
+    // 3. Maintain tests that serialize `version=0` values and ensure
+    //    decode/migration remains safe (see unit tests below).
+
     pub version: u32,
     pub session_id: Vec<u8>,
     pub payer: Address,
