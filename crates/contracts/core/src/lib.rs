@@ -3,6 +3,7 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, IntoVal,
     Symbol, Vec, token,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Symbol,
 };
 
 pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
@@ -88,7 +89,11 @@ pub struct Session {
     pub created_at: u64,
     pub updated_at: u64,
     pub dispute_deadline: u64,
+    PlatformFee,
+    Version,
 }
+
+const VERSION: u32 = 1;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -107,15 +112,41 @@ pub enum Error {
 
 #[contractimpl]
 impl SkillSyncContract {
-    pub fn init(env: Env, admin: Address) {
+    pub fn init(
+        env: Env,
+        admin: Address,
+        platform_fee_bps: u32,
+        treasury_address: Address,
+        dispute_window_secs: u64,
+    ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, Error::AlreadyInitialized);
+            return Err(Error::AlreadyInitialized);
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::DisputeWindow, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+            .set(&DataKey::PlatformFee, &platform_fee_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::Treasury, &treasury_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeWindow, &dispute_window_secs);
+        env.storage().instance().set(&DataKey::Version, &VERSION);
+
+        env.events().publish(
+            (Symbol::new(&env, "Initialized"),),
+            (
+                admin,
+                platform_fee_bps,
+                treasury_address,
+                dispute_window_secs,
+                VERSION,
+            ),
+        );
+
+        Ok(())
     }
 
     /// Stores a new session in persistent storage.
@@ -399,8 +430,9 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        client.init(&admin);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
         assert_eq!(client.get_dispute_window(), DEFAULT_DISPUTE_WINDOW_SECONDS);
 
         let updated = 120_u64;
@@ -416,8 +448,9 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        client.init(&admin);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
         let result = client.try_set_dispute_window(&(DISPUTE_WINDOW_MIN_SECONDS - 1));
         assert_eq!(result, Err(Ok(Error::InvalidDisputeWindow)));
     }
@@ -430,8 +463,9 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        client.init(&admin);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
         let result = client.try_set_dispute_window(&(DISPUTE_WINDOW_MAX_SECONDS + 1));
         assert_eq!(result, Err(Ok(Error::InvalidDisputeWindow)));
     }
@@ -444,8 +478,9 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        client.init(&admin);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
         client.set_dispute_window(&120_u64);
 
         let auths = env.auths();
@@ -461,8 +496,9 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        client.init(&admin);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
         let old = DEFAULT_DISPUTE_WINDOW_SECONDS;
         let new = 600_u64;
@@ -473,7 +509,12 @@ mod tests {
             vec![
                 &env,
                 (
-                    contract_id,
+                    contract_id.clone(),
+                    (Symbol::new(&env, "Initialized"),).into_val(&env),
+                    (admin, 100_u32, treasury, DEFAULT_DISPUTE_WINDOW_SECONDS, VERSION).into_val(&env)
+                ),
+                (
+                    contract_id.clone(),
                     (Symbol::new(&env, "DisputeWindowUpdated"),).into_val(&env),
                     (old, new).into_val(&env)
                 )
@@ -489,10 +530,11 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        client.init(&admin);
-        // Initially treasury should default to admin
-        assert_eq!(client.get_treasury(), admin);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+        // Initially treasury should default to stored treasury
+        assert_eq!(client.get_treasury(), treasury);
 
         let new_treasury = Address::generate(&env);
         client.set_treasury(&new_treasury);
@@ -507,8 +549,9 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        client.init(&admin);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
         let new_treasury = Address::generate(&env);
         client.set_treasury(&new_treasury);
 
@@ -525,10 +568,11 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
 
-        client.init(&admin);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
-        let old = admin;
+        let old = treasury.clone();
         let new = Address::generate(&env);
         client.set_treasury(&new);
 
@@ -537,7 +581,12 @@ mod tests {
             vec![
                 &env,
                 (
-                    contract_id,
+                    contract_id.clone(),
+                    (Symbol::new(&env, "Initialized"),).into_val(&env),
+                    (admin, 100_u32, treasury.clone(), DEFAULT_DISPUTE_WINDOW_SECONDS, VERSION).into_val(&env)
+                ),
+                (
+                    contract_id.clone(),
                     (Symbol::new(&env, "TreasuryUpdated"),).into_val(&env),
                     (old, new).into_val(&env)
                 )
@@ -634,6 +683,42 @@ mod tests {
 
     #[test]
     fn test_session_migration_compatibility_old_version_decodes() {
+    fn test_init_stores_correct_values_and_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let platform_fee_bps = 250_u32;
+        let dispute_window = 3600_u64;
+
+        client.init(&admin, &platform_fee_bps, &treasury, &dispute_window);
+
+        // Verify stored values. For admin/fee/version, there are no getters yet,
+        // but getting dispute_window and treasury verifies they are stored correctly.
+        assert_eq!(client.get_dispute_window(), dispute_window);
+        assert_eq!(client.get_treasury(), treasury);
+
+        // Verify event emitted
+        let events = env.events().all();
+        // Event should be the Initialized event
+        assert_eq!(
+            events,
+            vec![
+                &env,
+                (
+                    contract_id,
+                    (Symbol::new(&env, "Initialized"),).into_val(&env),
+                    (admin, platform_fee_bps, treasury, dispute_window, VERSION).into_val(&env)
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn test_init_twice_fails() {
         let env = Env::default();
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -660,6 +745,14 @@ mod tests {
         client.put_session(&old).unwrap();
         let got = client.get_session(&sid).unwrap();
         assert_eq!(got.version, 0);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Second init should revert
+        let result = client.try_init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+        assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
     }
 
     #[test]
