@@ -115,6 +115,45 @@ impl SkillSyncContract {
             .set(&DataKey::DisputeWindow, &DEFAULT_DISPUTE_WINDOW_SECONDS);
     }
 
+    /// Stores a new session in persistent storage.
+    ///
+    /// This function implements a pre-insert guard to ensure session_id uniqueness.
+    /// It prevents accidentally or maliciously creating duplicate sessions with the
+    /// same session_id, which could lead to confusion or invalid state.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    /// * `session` - The session to store. Must have a unique `session_id`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if the session was successfully stored.
+    /// - `Err(Error::DuplicateSessionId)` if a session with the same `session_id`
+    ///   already exists in storage.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic. Use `try_put_session()` to recover from errors
+    /// in calling code.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let result = contract.put_session(env, my_session);
+    /// match result {
+    ///     Ok(_) => {
+    ///         // Session stored successfully
+    ///     }
+    ///     Err(Error::DuplicateSessionId) => {
+    ///         // A session with this ID already exists
+    ///         // Consider retrying with a new UUID
+    ///     }
+    ///     Err(other) => {
+    ///         // Other error
+    ///     }
+    /// }
+    /// ```
     pub fn put_session(env: Env, session: Session) -> Result<(), Error> {
         let key = DataKey::Session(session.session_id.clone());
         
