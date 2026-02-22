@@ -329,4 +329,121 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn test_session_encode_decode_and_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let session_id = vec![&env, 1u8, 2u8, 3u8];
+        let amount: i128 = 1_000_000;
+        let fee_bps: u32 = 250;
+        let created_at: u64 = 1_000_000;
+
+        let s = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: asset.clone(),
+            amount,
+            fee_bps,
+            status: SessionStatus::Pending,
+            created_at,
+            updated_at: created_at,
+            dispute_deadline: created_at + DEFAULT_DISPUTE_WINDOW_SECONDS,
+        };
+
+        client.put_session(&s);
+
+        let got = client.get_session(&session_id);
+        assert!(got.is_some());
+        let got = got.unwrap();
+        assert_eq!(got.version, 1);
+        assert_eq!(got.session_id, session_id);
+        assert_eq!(got.payer, payer);
+        assert_eq!(got.payee, payee);
+        assert_eq!(got.asset, asset);
+        assert_eq!(got.amount, amount);
+        assert_eq!(got.fee_bps, fee_bps);
+        assert_eq!(got.status, SessionStatus::Pending);
+
+        // update status
+        let new_updated_at = created_at + 10;
+        client.update_session_status(&session_id, &SessionStatus::Completed, &new_updated_at).unwrap();
+        let got2 = client.get_session(&session_id).unwrap();
+        assert_eq!(got2.status, SessionStatus::Completed);
+        assert_eq!(got2.updated_at, new_updated_at);
+    }
+
+    #[test]
+    fn test_session_storage_keys_are_collision_free() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let base_addr = Address::generate(&env);
+        let sid1 = vec![&env, 1u8];
+        let sid2 = vec![&env, 2u8];
+
+        let s1 = Session {
+            version: 1,
+            session_id: sid1.clone(),
+            payer: base_addr.clone(),
+            payee: base_addr.clone(),
+            asset: base_addr.clone(),
+            amount: 10,
+            fee_bps: 0,
+            status: SessionStatus::Pending,
+            created_at: 0,
+            updated_at: 0,
+            dispute_deadline: 0,
+        };
+
+        let s2 = Session { session_id: sid2.clone(), ..s1.clone() };
+
+        client.put_session(&s1);
+        client.put_session(&s2);
+
+        let g1 = client.get_session(&sid1).unwrap();
+        let g2 = client.get_session(&sid2).unwrap();
+        assert_eq!(g1.session_id, sid1);
+        assert_eq!(g2.session_id, sid2);
+    }
+
+    #[test]
+    fn test_session_migration_compatibility_old_version_decodes() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+        let sid = vec![&env, 9u8, 9u8];
+
+        // Simulate older-version session (version 0)
+        let old = Session {
+            version: 0,
+            session_id: sid.clone(),
+            payer: addr.clone(),
+            payee: addr.clone(),
+            asset: addr.clone(),
+            amount: 0,
+            fee_bps: 0,
+            status: SessionStatus::Pending,
+            created_at: 0,
+            updated_at: 0,
+            dispute_deadline: 0,
+        };
+
+        // store and ensure we can read back (decode) older versions
+        client.put_session(&old);
+        let got = client.get_session(&sid).unwrap();
+        assert_eq!(got.version, 0);
+    }
 }
