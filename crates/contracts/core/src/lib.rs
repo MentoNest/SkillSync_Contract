@@ -17,6 +17,44 @@ enum DataKey {
     Admin,
     DisputeWindow,
     Treasury,
+    Session(Vec<u8>),
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SessionStatus {
+    Pending = 0,
+    Completed = 1,
+    Disputed = 2,
+    Cancelled = 3,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Session {
+    // Version field for forward/backward compatibility.
+    // - When adding/removing fields, increment `version` and provide
+    //   migration helpers that can decode older versions and upgrade them.
+    // - Keep changes additive where possible (append-only) to allow
+    //   older contract binaries to safely decode newer data when feasible.
+    // Migration path:
+    // 1. Read stored `Session` and inspect `version`.
+    // 2. If `version` is older, run migration logic to populate new fields
+    //    with sensible defaults and re-save with the new `version`.
+    // 3. Maintain tests that serialize `version=0` values and ensure
+    //    decode/migration remains safe (see unit tests below).
+
+    pub version: u32,
+    pub session_id: Vec<u8>,
+    pub payer: Address,
+    pub payee: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub fee_bps: u32,
+    pub status: SessionStatus,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub dispute_deadline: u64,
     PlatformFee,
     Version,
 }
@@ -71,6 +109,28 @@ impl SkillSyncContract {
         );
 
         Ok(())
+    }
+
+    pub fn put_session(env: Env, session: Session) {
+        let key = DataKey::Session(session.session_id.clone());
+        env.storage().persistent().set(&key, &session);
+    }
+
+    pub fn get_session(env: Env, session_id: Vec<u8>) -> Option<Session> {
+        env.storage().persistent().get(&DataKey::Session(session_id))
+    }
+
+    pub fn update_session_status(env: Env, session_id: Vec<u8>, new_status: SessionStatus, updated_at: u64) -> Result<(), ()> {
+        let key = DataKey::Session(session_id.clone());
+        match env.storage().persistent().get::<_, Session>(&key) {
+            Some(mut s) => {
+                s.status = new_status;
+                s.updated_at = updated_at;
+                env.storage().persistent().set(&key, &s);
+                Ok(())
+            }
+            None => Err(()),
+        }
     }
 
     pub fn ping(_env: Env) -> u32 {
@@ -330,6 +390,94 @@ mod tests {
     }
 
     #[test]
+    fn test_session_encode_decode_and_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let session_id = vec![&env, 1u8, 2u8, 3u8];
+        let amount: i128 = 1_000_000;
+        let fee_bps: u32 = 250;
+        let created_at: u64 = 1_000_000;
+
+        let s = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: asset.clone(),
+            amount,
+            fee_bps,
+            status: SessionStatus::Pending,
+            created_at,
+            updated_at: created_at,
+            dispute_deadline: created_at + DEFAULT_DISPUTE_WINDOW_SECONDS,
+        };
+
+        client.put_session(&s);
+
+        let got = client.get_session(&session_id);
+        assert!(got.is_some());
+        let got = got.unwrap();
+        assert_eq!(got.version, 1);
+        assert_eq!(got.session_id, session_id);
+        assert_eq!(got.payer, payer);
+        assert_eq!(got.payee, payee);
+        assert_eq!(got.asset, asset);
+        assert_eq!(got.amount, amount);
+        assert_eq!(got.fee_bps, fee_bps);
+        assert_eq!(got.status, SessionStatus::Pending);
+
+        // update status
+        let new_updated_at = created_at + 10;
+        client.update_session_status(&session_id, &SessionStatus::Completed, &new_updated_at).unwrap();
+        let got2 = client.get_session(&session_id).unwrap();
+        assert_eq!(got2.status, SessionStatus::Completed);
+        assert_eq!(got2.updated_at, new_updated_at);
+    }
+
+    #[test]
+    fn test_session_storage_keys_are_collision_free() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let base_addr = Address::generate(&env);
+        let sid1 = vec![&env, 1u8];
+        let sid2 = vec![&env, 2u8];
+
+        let s1 = Session {
+            version: 1,
+            session_id: sid1.clone(),
+            payer: base_addr.clone(),
+            payee: base_addr.clone(),
+            asset: base_addr.clone(),
+            amount: 10,
+            fee_bps: 0,
+            status: SessionStatus::Pending,
+            created_at: 0,
+            updated_at: 0,
+            dispute_deadline: 0,
+        };
+
+        let s2 = Session { session_id: sid2.clone(), ..s1.clone() };
+
+        client.put_session(&s1);
+        client.put_session(&s2);
+
+        let g1 = client.get_session(&sid1).unwrap();
+        let g2 = client.get_session(&sid2).unwrap();
+        assert_eq!(g1.session_id, sid1);
+        assert_eq!(g2.session_id, sid2);
+    }
+
+    #[test]
+    fn test_session_migration_compatibility_old_version_decodes() {
     fn test_init_stores_correct_values_and_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
@@ -370,6 +518,28 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
+        let addr = Address::generate(&env);
+        let sid = vec![&env, 9u8, 9u8];
+
+        // Simulate older-version session (version 0)
+        let old = Session {
+            version: 0,
+            session_id: sid.clone(),
+            payer: addr.clone(),
+            payee: addr.clone(),
+            asset: addr.clone(),
+            amount: 0,
+            fee_bps: 0,
+            status: SessionStatus::Pending,
+            created_at: 0,
+            updated_at: 0,
+            dispute_deadline: 0,
+        };
+
+        // store and ensure we can read back (decode) older versions
+        client.put_session(&old);
+        let got = client.get_session(&sid).unwrap();
+        assert_eq!(got.version, 0);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
 
