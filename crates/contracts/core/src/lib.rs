@@ -44,6 +44,38 @@ pub struct Session {
     //    with sensible defaults and re-save with the new `version`.
     // 3. Maintain tests that serialize `version=0` values and ensure
     //    decode/migration remains safe (see unit tests below).
+    //
+    // Session ID Generation (Recommended):
+    // ====================================
+    // The `session_id` field must be globally unique across all sessions.
+    // To prevent duplicate session IDs, offchain clients MUST generate IDs
+    // with high entropy before calling `put_session()`.
+    //
+    // Recommended approaches:
+    // 1. UUID v4 (Random): Use a cryptographically secure random UUID.
+    //    Example: Generate with `uuid::Uuid::new_v4()` in Rust/JS libraries
+    //    - Probability of collision: Negligible for practical purposes
+    //    - Suitable for session tracking across multiple users/trades
+    //
+    // 2. SHA256(random seed): Hash a high-entropy random value
+    //    Example: SHA256(CSPRNG bytes) → truncate or use full hash as ID
+    //    - Deterministic and verifiable if needed
+    //    - Same collision guarantees as UUID v4
+    //
+    // 3. Concatenate entropy: timestamp + random bytes + user nonce
+    //    Example: timestamp_ms (8 bytes) + CSPRNG (8 bytes) = 16 bytes
+    //    - Must use cryptographically secure random source
+    //    - Better than sequential or predictable IDs
+    //
+    // IMPORTANT: Do NOT use:
+    // - Sequential IDs (1, 2, 3, ...)
+    // - Hashed addresses alone (collides with multiple sessions per address)
+    // - Weak randomness (Math.random(), time-only based IDs)
+    // - User-controlled input without hashing/validation
+    //
+    // The contract enforces uniqueness via `put_session()`:
+    // - Returns `DuplicateSessionId` error if session_id already exists
+    // - This is a final guard; offchain systems should also validate uniqueness.
 
     pub version: u32,
     pub session_id: Vec<u8>,
