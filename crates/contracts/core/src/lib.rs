@@ -1,14 +1,14 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, IntoVal,
-    Symbol, Vec, token,
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes, Env,
+    Symbol, token,
 };
 
 pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
 pub const DISPUTE_WINDOW_MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_DISPUTE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+pub const PLATFORM_FEE_MAX_BPS: u32 = 1000; // 10%
 
 #[contract]
 pub struct SkillSyncContract;
@@ -18,8 +18,10 @@ pub struct SkillSyncContract;
 enum DataKey {
     Admin,
     DisputeWindow,
+    PlatformFee,
     Treasury,
-    Session(Vec<u8>),
+    Version,
+    Session(Bytes),
 }
 
 #[contracttype]
@@ -29,6 +31,7 @@ pub enum SessionStatus {
     Completed = 1,
     Disputed = 2,
     Cancelled = 3,
+    Locked = 4,
 }
 
 #[contracttype]
@@ -79,7 +82,7 @@ pub struct Session {
     // - This is a final guard; offchain systems should also validate uniqueness.
 
     pub version: u32,
-    pub session_id: Vec<u8>,
+    pub session_id: Bytes,
     pub payer: Address,
     pub payee: Address,
     pub asset: Address,
@@ -89,8 +92,6 @@ pub struct Session {
     pub created_at: u64,
     pub updated_at: u64,
     pub dispute_deadline: u64,
-    PlatformFee,
-    Version,
 }
 
 const VERSION: u32 = 1;
@@ -108,6 +109,8 @@ pub enum Error {
     InvalidAmount = 7,
     InsufficientBalance = 8,
     TransferError = 9,
+    InvalidFeeBps = 10,
+    SessionNotFound = 11,
 }
 
 #[contractimpl]
@@ -122,6 +125,9 @@ impl SkillSyncContract {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
+
+        validate_platform_fee_bps(platform_fee_bps)?;
+        validate_dispute_window(dispute_window_secs)?;
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -151,43 +157,8 @@ impl SkillSyncContract {
 
     /// Stores a new session in persistent storage.
     ///
-    /// This function implements a pre-insert guard to ensure session_id uniqueness.
-    /// It prevents accidentally or maliciously creating duplicate sessions with the
-    /// same session_id, which could lead to confusion or invalid state.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The contract environment
-    /// * `session` - The session to store. Must have a unique `session_id`.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())` if the session was successfully stored.
-    /// - `Err(Error::DuplicateSessionId)` if a session with the same `session_id`
-    ///   already exists in storage.
-    ///
-    /// # Panics
-    ///
-    /// This function does not panic. Use `try_put_session()` to recover from errors
-    /// in calling code.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let result = contract.put_session(env, my_session);
-    /// match result {
-    ///     Ok(_) => {
-    ///         // Session stored successfully
-    ///     }
-    ///     Err(Error::DuplicateSessionId) => {
-    ///         // A session with this ID already exists
-    ///         // Consider retrying with a new UUID
-    ///     }
-    ///     Err(other) => {
-    ///         // Other error
-    ///     }
-    /// }
-    /// ```
+    /// Enforces session_id uniqueness via a pre-insert guard.
+    /// Returns `Err(DuplicateSessionId)` if the session_id already exists.
     pub fn put_session(env: Env, session: Session) -> Result<(), Error> {
         let key = DataKey::Session(session.session_id.clone());
         
@@ -200,11 +171,11 @@ impl SkillSyncContract {
         Ok(())
     }
 
-    pub fn get_session(env: Env, session_id: Vec<u8>) -> Option<Session> {
+    pub fn get_session(env: Env, session_id: Bytes) -> Option<Session> {
         env.storage().persistent().get(&DataKey::Session(session_id))
     }
 
-    pub fn update_session_status(env: Env, session_id: Vec<u8>, new_status: SessionStatus, updated_at: u64) -> Result<(), ()> {
+    pub fn update_session_status(env: Env, session_id: Bytes, new_status: SessionStatus, updated_at: u64) -> Result<(), Error> {
         let key = DataKey::Session(session_id.clone());
         match env.storage().persistent().get::<_, Session>(&key) {
             Some(mut s) => {
@@ -213,7 +184,7 @@ impl SkillSyncContract {
                 env.storage().persistent().set(&key, &s);
                 Ok(())
             }
-            None => Err(()),
+            None => Err(Error::SessionNotFound),
         }
     }
 
@@ -269,54 +240,39 @@ impl SkillSyncContract {
         Ok(())
     }
 
+    pub fn get_platform_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformFee)
+            .unwrap_or(0)
+    }
+
+    pub fn set_platform_fee_bps(env: Env, new_bps: u32) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        validate_platform_fee_bps(new_bps)?;
+
+        let old = Self::get_platform_fee_bps(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformFee, &new_bps);
+        env.events()
+            .publish((Symbol::new(&env, "PlatformFeeUpdated"),), (old, new_bps));
+        Ok(())
+    }
+
     /// Locks funds in escrow for a mentorship session.
     ///
-    /// This function:
-    /// 1. Validates all inputs (nonzero amount, distinct parties, unique session_id)
-    /// 2. Checks and reserves platform fee based on fee_bps
-    /// 3. Transfers total funds (amount + fee) from payer to contract's escrow
-    /// 4. Creates and stores a Session struct with status=Locked
-    /// 5. Emits a FundsLocked event
+    /// Validates inputs, calculates the platform fee (`amount * fee_bps / 10000`),
+    /// checks payer balance, stores the session, transfers `amount + fee` from
+    /// payer to the contract, and emits a `FundsLocked` event.
     ///
-    /// # Arguments
-    ///
-    /// * `env` - The contract environment
-    /// * `session_id` - Globally unique session identifier (must not already exist)
-    /// * `payer` - Address of the mentor/service provider (sends funds)
-    /// * `payee` - Address of the student/service receiver (receives funds on completion)
-    /// * `asset` - Token address (must be a valid Soroban token contract)
-    /// * `amount` - Session/service amount in stroops (must be > 0)
-    /// * `fee_bps` - Platform fee in basis points (1 bps = 0.01%, max 10000 = 100%)
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())` if funds were successfully locked
-    /// - `Err(Error::DuplicateSessionId)` if session_id already exists
-    /// - `Err(Error::InvalidAmount)` if amount is zero or negative
-    /// - `Err(Error::InsufficientBalance)` if payer doesn't have enough balance
-    /// - `Err(Error::TransferError)` if token transfer fails
-    ///
-    /// # Events
-    ///
-    /// Emits `FundsLocked(session_id, payer, payee, amount, fee)` upon success
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let session_id = vec![&env, 0x01, 0x02, 0x03];
-    /// let result = contract.lock_funds(
-    ///     &env,
-    ///     &session_id,
-    ///     &mentor_addr,
-    ///     &student_addr,
-    ///     &token_addr,
-    ///     10_000_000_i128,  // 10 USDC (6 decimals)
-    ///     250_u32            // 2.5% fee
-    /// );
-    /// ```
+    /// Errors: `InvalidAmount`, `DuplicateSessionId`, `InsufficientBalance`,
+    /// `TransferError`.
     pub fn lock_funds(
         env: Env,
-        session_id: Vec<u8>,
+        session_id: Bytes,
         payer: Address,
         payee: Address,
         asset: Address,
@@ -405,12 +361,19 @@ fn validate_dispute_window(seconds: u64) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_platform_fee_bps(bps: u32) -> Result<(), Error> {
+    if bps > PLATFORM_FEE_MAX_BPS {
+        return Err(Error::InvalidFeeBps);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events},
-        vec, Address, Env, IntoVal,
+        testutils::{Address as _, Events, Ledger as _},
+        vec, Address, Bytes, Env, IntoVal, Symbol, token,
     };
 
     #[test]
@@ -425,7 +388,7 @@ mod tests {
     #[test]
     fn test_get_and_set_dispute_window_persists() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -443,7 +406,7 @@ mod tests {
     #[test]
     fn test_set_dispute_window_below_min_reverts() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -458,7 +421,7 @@ mod tests {
     #[test]
     fn test_set_dispute_window_above_max_reverts() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -473,7 +436,7 @@ mod tests {
     #[test]
     fn test_set_dispute_window_requires_admin_auth() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -491,7 +454,7 @@ mod tests {
     #[test]
     fn test_set_dispute_window_emits_event_with_old_and_new() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -525,7 +488,7 @@ mod tests {
     #[test]
     fn test_get_and_set_treasury_persists() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -544,7 +507,7 @@ mod tests {
     #[test]
     fn test_set_treasury_requires_admin_auth() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -563,7 +526,7 @@ mod tests {
     #[test]
     fn test_set_treasury_emits_event_with_old_and_new() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -597,7 +560,7 @@ mod tests {
     #[test]
     fn test_session_encode_decode_and_update() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -605,7 +568,7 @@ mod tests {
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
         let asset = Address::generate(&env);
-        let session_id = vec![&env, 1u8, 2u8, 3u8];
+        let session_id = Bytes::from_array(&env, &[1u8, 2u8, 3u8]);
         let amount: i128 = 1_000_000;
         let fee_bps: u32 = 250;
         let created_at: u64 = 1_000_000;
@@ -624,7 +587,7 @@ mod tests {
             dispute_deadline: created_at + DEFAULT_DISPUTE_WINDOW_SECONDS,
         };
 
-        client.put_session(&s).unwrap();
+        client.put_session(&s);
 
         let got = client.get_session(&session_id);
         assert!(got.is_some());
@@ -640,7 +603,7 @@ mod tests {
 
         // update status
         let new_updated_at = created_at + 10;
-        client.update_session_status(&session_id, &SessionStatus::Completed, &new_updated_at).unwrap();
+        client.update_session_status(&session_id, &SessionStatus::Completed, &new_updated_at);
         let got2 = client.get_session(&session_id).unwrap();
         assert_eq!(got2.status, SessionStatus::Completed);
         assert_eq!(got2.updated_at, new_updated_at);
@@ -653,8 +616,8 @@ mod tests {
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let base_addr = Address::generate(&env);
-        let sid1 = vec![&env, 1u8];
-        let sid2 = vec![&env, 2u8];
+        let sid1 = Bytes::from_array(&env, &[1u8]);
+        let sid2 = Bytes::from_array(&env, &[2u8]);
 
         let s1 = Session {
             version: 1,
@@ -672,8 +635,8 @@ mod tests {
 
         let s2 = Session { session_id: sid2.clone(), ..s1.clone() };
 
-        client.put_session(&s1).unwrap();
-        client.put_session(&s2).unwrap();
+        client.put_session(&s1);
+        client.put_session(&s2);
 
         let g1 = client.get_session(&sid1).unwrap();
         let g2 = client.get_session(&sid2).unwrap();
@@ -683,9 +646,37 @@ mod tests {
 
     #[test]
     fn test_session_migration_compatibility_old_version_decodes() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+        let sid = Bytes::from_array(&env, &[9u8, 9u8]);
+
+        // Simulate an older-version session (version 0) to verify forward-decode safety.
+        let old = Session {
+            version: 0,
+            session_id: sid.clone(),
+            payer: addr.clone(),
+            payee: addr.clone(),
+            asset: addr.clone(),
+            amount: 0,
+            fee_bps: 0,
+            status: SessionStatus::Pending,
+            created_at: 0,
+            updated_at: 0,
+            dispute_deadline: 0,
+        };
+
+        client.put_session(&old);
+        let got = client.get_session(&sid).unwrap();
+        assert_eq!(got.version, 0);
+    }
+
+    #[test]
     fn test_init_stores_correct_values_and_emits_event() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
@@ -696,14 +687,11 @@ mod tests {
 
         client.init(&admin, &platform_fee_bps, &treasury, &dispute_window);
 
-        // Verify stored values. For admin/fee/version, there are no getters yet,
-        // but getting dispute_window and treasury verifies they are stored correctly.
         assert_eq!(client.get_dispute_window(), dispute_window);
         assert_eq!(client.get_treasury(), treasury);
+        assert_eq!(client.get_platform_fee_bps(), platform_fee_bps);
 
-        // Verify event emitted
         let events = env.events().all();
-        // Event should be the Initialized event
         assert_eq!(
             events,
             vec![
@@ -723,34 +711,11 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
-        let addr = Address::generate(&env);
-        let sid = vec![&env, 9u8, 9u8];
-
-        // Simulate older-version session (version 0)
-        let old = Session {
-            version: 0,
-            session_id: sid.clone(),
-            payer: addr.clone(),
-            payee: addr.clone(),
-            asset: addr.clone(),
-            amount: 0,
-            fee_bps: 0,
-            status: SessionStatus::Pending,
-            created_at: 0,
-            updated_at: 0,
-            dispute_deadline: 0,
-        };
-
-        // store and ensure we can read back (decode) older versions
-        client.put_session(&old).unwrap();
-        let got = client.get_session(&sid).unwrap();
-        assert_eq!(got.version, 0);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
 
         client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
-        // Second init should revert
         let result = client.try_init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
         assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
     }
@@ -762,7 +727,7 @@ mod tests {
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let addr = Address::generate(&env);
-        let sid = vec![&env, 42u8, 7u8, 13u8];
+        let sid = Bytes::from_array(&env, &[42u8, 7u8, 13u8]);
 
         let session = Session {
             version: 1,
@@ -779,8 +744,7 @@ mod tests {
         };
 
         // First insertion should succeed
-        let result = client.put_session(&session);
-        assert!(result.is_ok());
+        client.put_session(&session);
 
         // Verify session was stored
         let stored = client.get_session(&sid);
@@ -795,7 +759,7 @@ mod tests {
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let addr = Address::generate(&env);
-        let sid = vec![&env, 99u8, 88u8];
+        let sid = Bytes::from_array(&env, &[99u8, 88u8]);
 
         let session1 = Session {
             version: 1,
@@ -815,13 +779,11 @@ mod tests {
         session2.amount = 2_000_000; // Different amount, same ID
 
         // First insertion should succeed
-        let result1 = client.put_session(&session1);
-        assert!(result1.is_ok());
+        client.put_session(&session1);
 
         // Second insertion with same session_id should fail
-        let result2 = client.put_session(&session2);
-        assert!(result2.is_err());
-        assert_eq!(result2.unwrap_err(), Ok(Error::DuplicateSessionId));
+        let result2 = client.try_put_session(&session2);
+        assert_eq!(result2, Err(Ok(Error::DuplicateSessionId)));
     }
 
     #[test]
@@ -831,9 +793,9 @@ mod tests {
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let addr = Address::generate(&env);
-        let sid1 = vec![&env, 1u8, 1u8];
-        let sid2 = vec![&env, 2u8, 2u8];
-        let sid3 = vec![&env, 3u8, 3u8];
+        let sid1 = Bytes::from_array(&env, &[1u8, 1u8]);
+        let sid2 = Bytes::from_array(&env, &[2u8, 2u8]);
+        let sid3 = Bytes::from_array(&env, &[3u8, 3u8]);
 
         let session1 = Session {
             version: 1,
@@ -853,9 +815,9 @@ mod tests {
         let session3 = Session { session_id: sid3.clone(), ..session1.clone() };
 
         // All different session_ids should be accepted
-        assert!(client.put_session(&session1).is_ok());
-        assert!(client.put_session(&session2).is_ok());
-        assert!(client.put_session(&session3).is_ok());
+        client.put_session(&session1);
+        client.put_session(&session2);
+        client.put_session(&session3);
 
         // Verify all three are stored
         assert!(client.get_session(&sid1).is_some());
@@ -870,7 +832,7 @@ mod tests {
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let addr = Address::generate(&env);
-        let sid = vec![&env, 123u8, 45u8, 67u8];
+        let sid = Bytes::from_array(&env, &[123u8, 45u8, 67u8]);
 
         let session = Session {
             version: 1,
@@ -887,7 +849,7 @@ mod tests {
         };
 
         // First insertion succeeds
-        assert!(client.put_session(&session).is_ok());
+        client.put_session(&session);
 
         // All subsequent attempts with same ID should fail
         for _ in 0..3 {
@@ -910,11 +872,10 @@ mod tests {
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let addr = Address::generate(&env);
-        let mut stored_ids = Vec::new();
 
         // Test with multiple single-byte session IDs (0-255 pattern)
         for i in 0u8..10u8 {
-            let sid = vec![&env, i];
+            let sid = Bytes::from_array(&env, &[i]);
             let session = Session {
                 version: 1,
                 session_id: sid.clone(),
@@ -929,20 +890,11 @@ mod tests {
                 dispute_deadline: (i as u64) + 86400,
             };
 
-            // Each unique ID should be accepted
-            assert!(client.put_session(&session).is_ok(), 
-                "Failed to insert session with ID {}", i);
-            
-            // Verify storage
-            assert!(client.get_session(&sid).is_some());
-            stored_ids.push(sid);
-        }
+            client.put_session(&session);
 
-        // Verify all IDs remain stored (one more check)
-        for (idx, sid) in stored_ids.iter().enumerate() {
-            let stored = client.get_session(sid);
+            let stored = client.get_session(&sid);
             assert!(stored.is_some());
-            assert_eq!(stored.unwrap().amount, (idx as i128) * 1000);
+            assert_eq!(stored.unwrap().amount, (i as i128) * 1000);
         }
     }
 
@@ -955,15 +907,15 @@ mod tests {
         let addr = Address::generate(&env);
 
         // Test with various multi-byte patterns simulating UUIDs or random IDs
-        let id_patterns = vec![
-            vec![&env, 0u8, 1u8, 2u8, 3u8],
-            vec![&env, 255u8, 254u8, 253u8],
-            vec![&env, 0x12u8, 0x34u8, 0x56u8, 0x78u8, 0x9au8],
-            vec![&env, 0xddu8, 0xeeu8, 0xffu8],
-            vec![&env, 1u8, 1u8, 1u8, 1u8, 1u8],
-            vec![&env, 0u8, 0u8, 0u8, 0u8],
-            vec![&env, 128u8, 64u8, 32u8, 16u8, 8u8, 4u8, 2u8, 1u8],
-            vec![&env, 7u8, 14u8, 21u8, 28u8, 35u8],
+        let id_patterns = [
+            Bytes::from_array(&env, &[0u8, 1u8, 2u8, 3u8]),
+            Bytes::from_array(&env, &[255u8, 254u8, 253u8]),
+            Bytes::from_array(&env, &[0x12u8, 0x34u8, 0x56u8, 0x78u8, 0x9au8]),
+            Bytes::from_array(&env, &[0xddu8, 0xeeu8, 0xffu8]),
+            Bytes::from_array(&env, &[1u8, 1u8, 1u8, 1u8, 1u8]),
+            Bytes::from_array(&env, &[0u8, 0u8, 0u8, 0u8]),
+            Bytes::from_array(&env, &[128u8, 64u8, 32u8, 16u8, 8u8, 4u8, 2u8, 1u8]),
+            Bytes::from_array(&env, &[7u8, 14u8, 21u8, 28u8, 35u8]),
         ];
 
         for (idx, sid) in id_patterns.iter().enumerate() {
@@ -982,8 +934,7 @@ mod tests {
             };
 
             // Each unique pattern should be accepted
-            assert!(client.put_session(&session).is_ok(),
-                "Failed to insert session with pattern index {}", idx);
+            client.put_session(&session);
 
             // Verify it's stored
             assert!(client.get_session(sid).is_some());
@@ -1020,13 +971,13 @@ mod tests {
         let addr = Address::generate(&env);
 
         // Simulate large ID patterns (like SHA256 hashes or UUIDs)
-        let large_ids = vec![
-            vec![&env, 0x4du8, 0x6fu8, 0x9eu8, 0x8bu8, 0xcdu8, 0xf4u8, 0x2bu8, 0xa0u8, 
-                 0x45u8, 0xcfu8, 0x15u8, 0x11u8, 0x6au8, 0x7bu8, 0xd8u8, 0xe9u8],
-            vec![&env, 0xffu8, 0xeeu8, 0xddu8, 0xccu8, 0xbbu8, 0xaau8, 0x99u8, 0x88u8,
-                 0x77u8, 0x66u8, 0x55u8, 0x44u8, 0x33u8, 0x22u8, 0x11u8, 0x00u8],
-            vec![&env, 0x00u8, 0x11u8, 0x22u8, 0x33u8, 0x44u8, 0x55u8, 0x66u8, 0x77u8,
-                 0x88u8, 0x99u8, 0xaau8, 0xbbu8, 0xccu8, 0xddu8, 0xeeu8, 0xffu8],
+        let large_ids = [
+            Bytes::from_array(&env, &[0x4du8, 0x6fu8, 0x9eu8, 0x8bu8, 0xcdu8, 0xf4u8, 0x2bu8, 0xa0u8,
+                 0x45u8, 0xcfu8, 0x15u8, 0x11u8, 0x6au8, 0x7bu8, 0xd8u8, 0xe9u8]),
+            Bytes::from_array(&env, &[0xffu8, 0xeeu8, 0xddu8, 0xccu8, 0xbbu8, 0xaau8, 0x99u8, 0x88u8,
+                 0x77u8, 0x66u8, 0x55u8, 0x44u8, 0x33u8, 0x22u8, 0x11u8, 0x00u8]),
+            Bytes::from_array(&env, &[0x00u8, 0x11u8, 0x22u8, 0x33u8, 0x44u8, 0x55u8, 0x66u8, 0x77u8,
+                 0x88u8, 0x99u8, 0xaau8, 0xbbu8, 0xccu8, 0xddu8, 0xeeu8, 0xffu8]),
         ];
 
         for (idx, sid) in large_ids.iter().enumerate() {
@@ -1044,8 +995,7 @@ mod tests {
                 dispute_deadline: 1_086_400,
             };
 
-            assert!(client.put_session(&session).is_ok(),
-                "Failed to insert large ID pattern {}", idx);
+            client.put_session(&session);
             assert!(client.get_session(sid).is_some());
         }
 
@@ -1082,7 +1032,7 @@ mod tests {
         let addr = Address::generate(&env);
 
         // Single byte minimal ID
-        let sid_min = vec![&env, 0u8];
+        let sid_min = Bytes::from_array(&env, &[0u8]);
         let session_min = Session {
             version: 1,
             session_id: sid_min.clone(),
@@ -1097,7 +1047,7 @@ mod tests {
             dispute_deadline: 0,
         };
 
-        assert!(client.put_session(&session_min).is_ok());
+        client.put_session(&session_min);
         assert!(client.get_session(&sid_min).is_some());
 
         // Attempting duplicate should fail
@@ -1113,29 +1063,23 @@ mod tests {
     #[test]
     fn test_lock_funds_happy_path() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
-        // Setup addresses and token
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract(payer.clone());
-        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract(payer.clone());
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
 
-        // Create a token client with test utils
-        let token_id = Address::from_contract_id(&env, &token_contract);
-        let token_client = token::Client::new(&env, &token_id);
+        token_admin.mint(&payer, &(10_000_000_i128));
 
-        // Mint tokens to payer
-        token_client.mint(&payer, &(10_000_000_i128));
-
-        let session_id = vec![&env, 1u8, 2u8, 3u8];
+        let session_id = Bytes::from_array(&env, &[1u8, 2u8, 3u8]);
         let amount = 1_000_000_i128;
         let fee_bps = 250u32; // 2.5%
 
-        let result = client.lock_funds(
+        client.lock_funds(
             &session_id,
             &payer,
             &payee,
@@ -1143,8 +1087,6 @@ mod tests {
             &amount,
             &fee_bps,
         );
-
-        assert!(result.is_ok());
 
         // Verify session was created and stored
         let stored_session = client.get_session(&session_id);
@@ -1162,16 +1104,15 @@ mod tests {
     #[test]
     fn test_lock_funds_rejects_zero_amount() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract(payer.clone());
-        let token_id = Address::from_contract_id(&env, &token_contract);
-        let session_id = vec![&env, 5u8, 6u8];
+        let token_id = env.register_stellar_asset_contract(payer.clone());
+        let session_id = Bytes::from_array(&env, &[5u8, 6u8]);
 
         let result = client.try_lock_funds(
             &session_id,
@@ -1189,16 +1130,15 @@ mod tests {
     #[test]
     fn test_lock_funds_rejects_negative_amount() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract(payer.clone());
-        let token_id = Address::from_contract_id(&env, &token_contract);
-        let session_id = vec![&env, 7u8, 8u8];
+        let token_id = env.register_stellar_asset_contract(payer.clone());
+        let session_id = Bytes::from_array(&env, &[7u8, 8u8]);
 
         let result = client.try_lock_funds(
             &session_id,
@@ -1216,7 +1156,7 @@ mod tests {
     #[test]
     fn test_lock_funds_rejects_duplicate_session_id() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
@@ -1224,20 +1164,16 @@ mod tests {
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
         let payee2 = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract(payer.clone());
-        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_id = env.register_stellar_asset_contract(payer.clone());
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        token_admin.mint(&payer, &(50_000_000_i128));
 
-        // Mint tokens to payer
-        let token_client = token::Client::new(&env, &token_id);
-        token_client.mint(&payer, &(50_000_000_i128));
-
-        let session_id = vec![&env, 10u8, 11u8];
+        let session_id = Bytes::from_array(&env, &[10u8, 11u8]);
         let amount = 1_000_000_i128;
         let fee_bps = 100u32;
 
         // First lock should succeed
-        let result1 = client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
-        assert!(result1.is_ok());
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
 
         // Second lock with same session_id should fail
         let result2 = client.try_lock_funds(
@@ -1255,55 +1191,47 @@ mod tests {
     #[test]
     fn test_lock_funds_sufficient_balance() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract(payer.clone());
-        let token_id = Address::from_contract_id(&env, &token_contract);
-
-        // Mint exactly enough for amount + fee
-        let token_client = token::Client::new(&env, &token_id);
+        let token_id = env.register_stellar_asset_contract(payer.clone());
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
         let amount = 1_000_000_i128;
         let fee_bps = 250u32; // 2.5%
         let fee = (amount * fee_bps as i128) / 10000; // 25000
         let total = amount + fee;
 
-        token_client.mint(&payer, &total);
+        token_admin.mint(&payer, &total);
 
-        let session_id = vec![&env, 12u8, 13u8, 14u8];
-        let result = client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
-
-        assert!(result.is_ok());
+        let session_id = Bytes::from_array(&env, &[12u8, 13u8, 14u8]);
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
     }
 
     #[test]
     fn test_lock_funds_insufficient_balance() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract(payer.clone());
-        let token_id = Address::from_contract_id(&env, &token_contract);
-
-        // Mint tokens but not enough for amount + fee
-        let token_client = token::Client::new(&env, &token_id);
+        let token_id = env.register_stellar_asset_contract(payer.clone());
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
         let amount = 1_000_000_i128;
         let fee_bps = 250u32;
         let fee = (amount * fee_bps as i128) / 10000;
         let total_needed = amount + fee;
 
         // Only mint 90% of needed amount
-        token_client.mint(&payer, &(total_needed * 9 / 10));
+        token_admin.mint(&payer, &(total_needed * 9 / 10));
 
-        let session_id = vec![&env, 15u8, 16u8];
+        let session_id = Bytes::from_array(&env, &[15u8, 16u8]);
         let result = client.try_lock_funds(
             &session_id,
             &payer,
@@ -1320,20 +1248,18 @@ mod tests {
     #[test]
     fn test_lock_funds_platform_fee_calculation() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract(payer.clone());
-        let token_id = Address::from_contract_id(&env, &token_contract);
-
-        let token_client = token::Client::new(&env, &token_id);
+        let token_id = env.register_stellar_asset_contract(payer.clone());
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
 
         // Test various fee scenarios
-        let test_cases = vec![
+        let test_cases: [(i128, u32, i128); 6] = [
             (1_000_000i128, 0u32, 0i128),        // 0% fee
             (1_000_000i128, 100u32, 10_000i128), // 1% fee = 10,000
             (1_000_000i128, 250u32, 25_000i128), // 2.5% fee = 25,000
@@ -1342,46 +1268,41 @@ mod tests {
             (10_000_000i128, 500u32, 500_000i128), // 5% of 10M = 500,000
         ];
 
-        for (idx, (amount, fee_bps, expected_fee)) in test_cases.iter().enumerate() {
-            token_client.mint(&payer, &(amount + expected_fee + 100_000)); // Add buffer
+        for (idx, &(amount, fee_bps, expected_fee)) in test_cases.iter().enumerate() {
+            token_admin.mint(&payer, &(amount + expected_fee + 100_000)); // Add buffer
 
-            let session_id = vec![&env, 20u8 + (idx as u8), 21u8];
-            let result = client.lock_funds(&session_id, &payer, &payee, &token_id, amount, fee_bps);
-            assert!(result.is_ok(), "Failed for test case {}", idx);
+            let session_id = Bytes::from_array(&env, &[20u8 + idx as u8, 21u8]);
+            client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
 
             // Verify stored session has correct amounts
             let session = client.get_session(&session_id).unwrap();
-            assert_eq!(session.amount, *amount);
-            assert_eq!(session.fee_bps, *fee_bps);
+            assert_eq!(session.amount, amount);
+            assert_eq!(session.fee_bps, fee_bps);
         }
     }
 
     #[test]
     fn test_lock_funds_creates_session_with_correct_timestamp() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract(payer.clone());
-        let token_id = Address::from_contract_id(&env, &token_contract);
-
-        let token_client = token::Client::new(&env, &token_id);
-        token_client.mint(&payer, &(10_000_000_i128));
+        let token_id = env.register_stellar_asset_contract(payer.clone());
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        token_admin.mint(&payer, &(10_000_000_i128));
 
         // Set a specific ledger timestamp
-        let (current_block, _slot) = env.ledger().sequence_and_timestamp();
         let timestamp = 1_000_000u64;
-        env.ledger().set_timestamp(timestamp);
+        env.ledger().with_mut(|l| l.timestamp = timestamp);
 
-        let session_id = vec![&env, 30u8, 31u8];
+        let session_id = Bytes::from_array(&env, &[30u8, 31u8]);
         let amount = 1_000_000i128;
 
-        let result = client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &100u32);
-        assert!(result.is_ok());
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &100u32);
 
         let session = client.get_session(&session_id).unwrap();
         assert_eq!(session.created_at, timestamp);
@@ -1392,75 +1313,67 @@ mod tests {
     #[test]
     fn test_lock_funds_emits_event() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract(payer.clone());
-        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_id = env.register_stellar_asset_contract(payer.clone());
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        token_admin.mint(&payer, &(10_000_000_i128));
 
-        let token_client = token::Client::new(&env, &token_id);
-        token_client.mint(&payer, &(10_000_000_i128));
-
-        env.events().publish((), ()); // Clear event buffer
-
-        let session_id = vec![&env, 40u8, 41u8, 42u8];
+        let session_id = Bytes::from_array(&env, &[40u8, 41u8, 42u8]);
         let amount = 1_000_000i128;
         let fee_bps = 250u32;
         let expected_fee = (amount * fee_bps as i128) / 10000;
 
-        let result = client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
-        assert!(result.is_ok());
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
 
-        // Verify FundsLocked event was emitted
-        let events = env.events().all();
-        
-        // Find the FundsLocked event (skip the mint events)
-        let mut found_event = false;
-        for event in events {
-            if let Some(topics) = event.2.get(0) {
-                if let Ok(symbol) = Symbol::try_from(topics) {
-                    if symbol.to_string(&env) == Some("FundsLocked".to_string()) {
-                        found_event = true;
-                        break;
-                    }
-                }
-            }
-        }
-        assert!(found_event, "FundsLocked event not found");
+        // The last event emitted by our contract should be FundsLocked.
+        let all = env.events().all();
+        let n = all.len();
+        assert!(n > 0, "no events emitted");
+        assert_eq!(
+            all.slice(n - 1..),
+            vec![
+                &env,
+                (
+                    contract_id.clone(),
+                    (Symbol::new(&env, "FundsLocked"),).into_val(&env),
+                    (session_id.clone(), payer.clone(), payee.clone(), amount, expected_fee).into_val(&env)
+                )
+            ]
+        );
     }
 
     #[test]
     fn test_lock_funds_multiple_sessions_different_parties() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
-        let token_contract = env.register_stellar_asset_contract(Address::generate(&env));
-        let token_id = Address::from_contract_id(&env, &token_contract);
-        let token_client = token::Client::new(&env, &token_id);
+        let token_id = env.register_stellar_asset_contract(Address::generate(&env));
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
 
         // Create multiple sessions with different parties
         let base_payer = Address::generate(&env);
-        token_client.mint(&base_payer, &(100_000_000_i128));
+        token_admin.mint(&base_payer, &(100_000_000_i128));
 
         for i in 0..5 {
             let payer = if i == 0 { base_payer.clone() } else { Address::generate(&env) };
             if i > 0 {
-                token_client.mint(&payer, &(10_000_000_i128));
+                token_admin.mint(&payer, &(10_000_000_i128));
             }
 
             let payee = Address::generate(&env);
-            let session_id = vec![&env, 50u8 + (i as u8), 51u8];
+            let session_id = Bytes::from_array(&env, &[50u8 + i as u8, 51u8]);
             let amount = 1_000_000i128 + (i as i128 * 100_000);
 
-            let result = client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &100u32);
-            assert!(result.is_ok(), "Failed to lock funds for session {}", i);
+            client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &100u32);
 
             let session = client.get_session(&session_id).unwrap();
             assert_eq!(session.payer, payer);
@@ -1472,30 +1385,232 @@ mod tests {
     #[test]
     fn test_lock_funds_max_fee_calculation() {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
         let payer = Address::generate(&env);
         let payee = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract(payer.clone());
-        let token_id = Address::from_contract_id(&env, &token_contract);
-
-        let token_client = token::Client::new(&env, &token_id);
+        let token_id = env.register_stellar_asset_contract(payer.clone());
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
 
         // Test maximum fee (10000 bps = 100%)
         let amount = 1_000_000i128;
         let fee_bps = 10000u32; // 100% fee
-        let expected_fee = amount; // 100% of amount
 
-        token_client.mint(&payer, &(amount * 2 + 100_000)); // Need double for 100% fee
+        token_admin.mint(&payer, &(amount * 2 + 100_000)); // Need double for 100% fee
 
-        let session_id = vec![&env, 60u8, 61u8];
-        let result = client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
-        assert!(result.is_ok());
+        let session_id = Bytes::from_array(&env, &[60u8, 61u8]);
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
 
         let session = client.get_session(&session_id).unwrap();
         assert_eq!(session.fee_bps, fee_bps);
+    }
+
+    // =========================================================================
+    // platform fee tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_platform_fee_bps_returns_value_set_at_init() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+        assert_eq!(client.get_platform_fee_bps(), 250);
+    }
+
+    #[test]
+    fn test_set_platform_fee_bps_persists() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        client.set_platform_fee_bps(&500);
+        assert_eq!(client.get_platform_fee_bps(), 500);
+    }
+
+    #[test]
+    fn test_set_platform_fee_bps_at_zero_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        assert!(client.try_set_platform_fee_bps(&0).is_ok());
+        assert_eq!(client.get_platform_fee_bps(), 0);
+    }
+
+    #[test]
+    fn test_set_platform_fee_bps_at_max_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        assert!(client.try_set_platform_fee_bps(&PLATFORM_FEE_MAX_BPS).is_ok());
+        assert_eq!(client.get_platform_fee_bps(), PLATFORM_FEE_MAX_BPS);
+    }
+
+    #[test]
+    fn test_set_platform_fee_bps_above_max_reverts() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        let result = client.try_set_platform_fee_bps(&(PLATFORM_FEE_MAX_BPS + 1));
+        assert_eq!(result, Err(Ok(Error::InvalidFeeBps)));
+    }
+
+    #[test]
+    fn test_init_with_fee_above_max_reverts() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let result = client.try_init(
+            &admin,
+            &(PLATFORM_FEE_MAX_BPS + 1),
+            &treasury,
+            &DEFAULT_DISPUTE_WINDOW_SECONDS,
+        );
+        assert_eq!(result, Err(Ok(Error::InvalidFeeBps)));
+    }
+
+    #[test]
+    fn test_set_platform_fee_bps_requires_admin_auth() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+        client.set_platform_fee_bps(&200);
+
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, admin);
+    }
+
+    #[test]
+    fn test_set_platform_fee_bps_emits_event_with_old_and_new() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        let old_fee = 100_u32;
+        let new_fee = 300_u32;
+        client.set_platform_fee_bps(&new_fee);
+
+        assert_eq!(
+            env.events().all(),
+            vec![
+                &env,
+                (
+                    contract_id.clone(),
+                    (Symbol::new(&env, "Initialized"),).into_val(&env),
+                    (admin, old_fee, treasury, DEFAULT_DISPUTE_WINDOW_SECONDS, VERSION)
+                        .into_val(&env)
+                ),
+                (
+                    contract_id.clone(),
+                    (Symbol::new(&env, "PlatformFeeUpdated"),).into_val(&env),
+                    (old_fee, new_fee).into_val(&env)
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn test_set_platform_fee_bps_event_reflects_successive_updates() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &0, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // First update: 0 → 500
+        client.set_platform_fee_bps(&500);
+        assert_eq!(client.get_platform_fee_bps(), 500);
+
+        // Second update: 500 → 1000
+        client.set_platform_fee_bps(&PLATFORM_FEE_MAX_BPS);
+        assert_eq!(client.get_platform_fee_bps(), PLATFORM_FEE_MAX_BPS);
+
+        // Third update: 1000 → 0
+        client.set_platform_fee_bps(&0);
+        assert_eq!(client.get_platform_fee_bps(), 0);
+
+        // events[0] = Initialized, [1] = PlatformFeeUpdated(0→500),
+        // [2] = PlatformFeeUpdated(500→1000), [3] = PlatformFeeUpdated(1000→0)
+        assert_eq!(
+            env.events().all(),
+            vec![
+                &env,
+                (
+                    contract_id.clone(),
+                    (Symbol::new(&env, "Initialized"),).into_val(&env),
+                    (admin.clone(), 0_u32, treasury.clone(), DEFAULT_DISPUTE_WINDOW_SECONDS, VERSION).into_val(&env)
+                ),
+                (
+                    contract_id.clone(),
+                    (Symbol::new(&env, "PlatformFeeUpdated"),).into_val(&env),
+                    (0_u32, 500_u32).into_val(&env)
+                ),
+                (
+                    contract_id.clone(),
+                    (Symbol::new(&env, "PlatformFeeUpdated"),).into_val(&env),
+                    (500_u32, PLATFORM_FEE_MAX_BPS).into_val(&env)
+                ),
+                (
+                    contract_id.clone(),
+                    (Symbol::new(&env, "PlatformFeeUpdated"),).into_val(&env),
+                    (PLATFORM_FEE_MAX_BPS, 0_u32).into_val(&env)
+                ),
+            ]
+        );
     }
 }
