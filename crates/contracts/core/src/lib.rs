@@ -18,6 +18,32 @@ enum DataKey {
     Admin,
     DisputeWindow,
     Treasury,
+    Session(Vec<u8>),
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SessionStatus {
+    Pending = 0,
+    Completed = 1,
+    Disputed = 2,
+    Cancelled = 3,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Session {
+    pub version: u32,
+    pub session_id: Vec<u8>,
+    pub payer: Address,
+    pub payee: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub fee_bps: u32,
+    pub status: SessionStatus,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub dispute_deadline: u64,
 }
 
 #[contracterror]
@@ -42,6 +68,28 @@ impl SkillSyncContract {
         env.storage()
             .instance()
             .set(&DataKey::DisputeWindow, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+    }
+
+    pub fn put_session(env: Env, session: Session) {
+        let key = DataKey::Session(session.session_id.clone());
+        env.storage().persistent().set(&key, &session);
+    }
+
+    pub fn get_session(env: Env, session_id: Vec<u8>) -> Option<Session> {
+        env.storage().persistent().get(&DataKey::Session(session_id))
+    }
+
+    pub fn update_session_status(env: Env, session_id: Vec<u8>, new_status: SessionStatus, updated_at: u64) -> Result<(), ()> {
+        let key = DataKey::Session(session_id.clone());
+        match env.storage().persistent().get::<_, Session>(&key) {
+            Some(mut s) => {
+                s.status = new_status;
+                s.updated_at = updated_at;
+                env.storage().persistent().set(&key, &s);
+                Ok(())
+            }
+            None => Err(()),
+        }
     }
 
     pub fn ping(_env: Env) -> u32 {
