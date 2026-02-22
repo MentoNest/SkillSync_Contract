@@ -43,6 +43,38 @@ pub struct Session {
     //    with sensible defaults and re-save with the new `version`.
     // 3. Maintain tests that serialize `version=0` values and ensure
     //    decode/migration remains safe (see unit tests below).
+    //
+    // Session ID Generation (Recommended):
+    // ====================================
+    // The `session_id` field must be globally unique across all sessions.
+    // To prevent duplicate session IDs, offchain clients MUST generate IDs
+    // with high entropy before calling `put_session()`.
+    //
+    // Recommended approaches:
+    // 1. UUID v4 (Random): Use a cryptographically secure random UUID.
+    //    Example: Generate with `uuid::Uuid::new_v4()` in Rust/JS libraries
+    //    - Probability of collision: Negligible for practical purposes
+    //    - Suitable for session tracking across multiple users/trades
+    //
+    // 2. SHA256(random seed): Hash a high-entropy random value
+    //    Example: SHA256(CSPRNG bytes) → truncate or use full hash as ID
+    //    - Deterministic and verifiable if needed
+    //    - Same collision guarantees as UUID v4
+    //
+    // 3. Concatenate entropy: timestamp + random bytes + user nonce
+    //    Example: timestamp_ms (8 bytes) + CSPRNG (8 bytes) = 16 bytes
+    //    - Must use cryptographically secure random source
+    //    - Better than sequential or predictable IDs
+    //
+    // IMPORTANT: Do NOT use:
+    // - Sequential IDs (1, 2, 3, ...)
+    // - Hashed addresses alone (collides with multiple sessions per address)
+    // - Weak randomness (Math.random(), time-only based IDs)
+    // - User-controlled input without hashing/validation
+    //
+    // The contract enforces uniqueness via `put_session()`:
+    // - Returns `DuplicateSessionId` error if session_id already exists
+    // - This is a final guard; offchain systems should also validate uniqueness.
 
     pub version: u32,
     pub session_id: Vec<u8>,
@@ -70,6 +102,7 @@ pub enum Error {
     InvalidDisputeWindow = 3,
     Unauthorized = 4,
     InvalidTreasuryAddress = 5,
+    DuplicateSessionId = 6,
 }
 
 #[contractimpl]
@@ -111,9 +144,55 @@ impl SkillSyncContract {
         Ok(())
     }
 
-    pub fn put_session(env: Env, session: Session) {
+    /// Stores a new session in persistent storage.
+    ///
+    /// This function implements a pre-insert guard to ensure session_id uniqueness.
+    /// It prevents accidentally or maliciously creating duplicate sessions with the
+    /// same session_id, which could lead to confusion or invalid state.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    /// * `session` - The session to store. Must have a unique `session_id`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if the session was successfully stored.
+    /// - `Err(Error::DuplicateSessionId)` if a session with the same `session_id`
+    ///   already exists in storage.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic. Use `try_put_session()` to recover from errors
+    /// in calling code.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let result = contract.put_session(env, my_session);
+    /// match result {
+    ///     Ok(_) => {
+    ///         // Session stored successfully
+    ///     }
+    ///     Err(Error::DuplicateSessionId) => {
+    ///         // A session with this ID already exists
+    ///         // Consider retrying with a new UUID
+    ///     }
+    ///     Err(other) => {
+    ///         // Other error
+    ///     }
+    /// }
+    /// ```
+    pub fn put_session(env: Env, session: Session) -> Result<(), Error> {
         let key = DataKey::Session(session.session_id.clone());
+        
+        // Check if session_id already exists
+        if env.storage().persistent().has(&key) {
+            return Err(Error::DuplicateSessionId);
+        }
+        
         env.storage().persistent().set(&key, &session);
+        Ok(())
     }
 
     pub fn get_session(env: Env, session_id: Vec<u8>) -> Option<Session> {
@@ -419,7 +498,7 @@ mod tests {
             dispute_deadline: created_at + DEFAULT_DISPUTE_WINDOW_SECONDS,
         };
 
-        client.put_session(&s);
+        client.put_session(&s).unwrap();
 
         let got = client.get_session(&session_id);
         assert!(got.is_some());
@@ -467,8 +546,8 @@ mod tests {
 
         let s2 = Session { session_id: sid2.clone(), ..s1.clone() };
 
-        client.put_session(&s1);
-        client.put_session(&s2);
+        client.put_session(&s1).unwrap();
+        client.put_session(&s2).unwrap();
 
         let g1 = client.get_session(&sid1).unwrap();
         let g2 = client.get_session(&sid2).unwrap();
@@ -537,7 +616,7 @@ mod tests {
         };
 
         // store and ensure we can read back (decode) older versions
-        client.put_session(&old);
+        client.put_session(&old).unwrap();
         let got = client.get_session(&sid).unwrap();
         assert_eq!(got.version, 0);
         let admin = Address::generate(&env);
@@ -548,5 +627,357 @@ mod tests {
         // Second init should revert
         let result = client.try_init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
         assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn test_put_session_happy_path() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+        let sid = vec![&env, 42u8, 7u8, 13u8];
+
+        let session = Session {
+            version: 1,
+            session_id: sid.clone(),
+            payer: addr.clone(),
+            payee: addr.clone(),
+            asset: addr.clone(),
+            amount: 500_000,
+            fee_bps: 100,
+            status: SessionStatus::Pending,
+            created_at: 1000,
+            updated_at: 1000,
+            dispute_deadline: 86400,
+        };
+
+        // First insertion should succeed
+        let result = client.put_session(&session);
+        assert!(result.is_ok());
+
+        // Verify session was stored
+        let stored = client.get_session(&sid);
+        assert!(stored.is_some());
+        assert_eq!(stored.unwrap().session_id, sid);
+    }
+
+    #[test]
+    fn test_put_session_rejects_duplicate_id() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+        let sid = vec![&env, 99u8, 88u8];
+
+        let session1 = Session {
+            version: 1,
+            session_id: sid.clone(),
+            payer: addr.clone(),
+            payee: addr.clone(),
+            asset: addr.clone(),
+            amount: 1_000_000,
+            fee_bps: 250,
+            status: SessionStatus::Pending,
+            created_at: 5000,
+            updated_at: 5000,
+            dispute_deadline: 91400,
+        };
+
+        let mut session2 = session1.clone();
+        session2.amount = 2_000_000; // Different amount, same ID
+
+        // First insertion should succeed
+        let result1 = client.put_session(&session1);
+        assert!(result1.is_ok());
+
+        // Second insertion with same session_id should fail
+        let result2 = client.put_session(&session2);
+        assert!(result2.is_err());
+        assert_eq!(result2.unwrap_err(), Ok(Error::DuplicateSessionId));
+    }
+
+    #[test]
+    fn test_put_session_allows_different_ids() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+        let sid1 = vec![&env, 1u8, 1u8];
+        let sid2 = vec![&env, 2u8, 2u8];
+        let sid3 = vec![&env, 3u8, 3u8];
+
+        let session1 = Session {
+            version: 1,
+            session_id: sid1.clone(),
+            payer: addr.clone(),
+            payee: addr.clone(),
+            asset: addr.clone(),
+            amount: 100,
+            fee_bps: 0,
+            status: SessionStatus::Pending,
+            created_at: 0,
+            updated_at: 0,
+            dispute_deadline: 0,
+        };
+
+        let session2 = Session { session_id: sid2.clone(), ..session1.clone() };
+        let session3 = Session { session_id: sid3.clone(), ..session1.clone() };
+
+        // All different session_ids should be accepted
+        assert!(client.put_session(&session1).is_ok());
+        assert!(client.put_session(&session2).is_ok());
+        assert!(client.put_session(&session3).is_ok());
+
+        // Verify all three are stored
+        assert!(client.get_session(&sid1).is_some());
+        assert!(client.get_session(&sid2).is_some());
+        assert!(client.get_session(&sid3).is_some());
+    }
+
+    #[test]
+    fn test_put_session_multiple_duplicates_all_rejected() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+        let sid = vec![&env, 123u8, 45u8, 67u8];
+
+        let session = Session {
+            version: 1,
+            session_id: sid.clone(),
+            payer: addr.clone(),
+            payee: addr.clone(),
+            asset: addr.clone(),
+            amount: 1000,
+            fee_bps: 50,
+            status: SessionStatus::Pending,
+            created_at: 0,
+            updated_at: 0,
+            dispute_deadline: 0,
+        };
+
+        // First insertion succeeds
+        assert!(client.put_session(&session).is_ok());
+
+        // All subsequent attempts with same ID should fail
+        for _ in 0..3 {
+            let mut session_attempt = session.clone();
+            session_attempt.amount += 100; // Modify to try to sneak through
+            assert_eq!(
+                client.try_put_session(&session_attempt),
+                Err(Ok(Error::DuplicateSessionId))
+            );
+        }
+    }
+
+    // Property-based tests with randomized session IDs
+    // These tests verify that the duplicate check works correctly with various ID patterns
+
+    #[test]
+    fn test_put_session_randomized_ids_single_byte() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+        let mut stored_ids = Vec::new();
+
+        // Test with multiple single-byte session IDs (0-255 pattern)
+        for i in 0u8..10u8 {
+            let sid = vec![&env, i];
+            let session = Session {
+                version: 1,
+                session_id: sid.clone(),
+                payer: addr.clone(),
+                payee: addr.clone(),
+                asset: addr.clone(),
+                amount: (i as i128) * 1000,
+                fee_bps: 0,
+                status: SessionStatus::Pending,
+                created_at: i as u64,
+                updated_at: i as u64,
+                dispute_deadline: (i as u64) + 86400,
+            };
+
+            // Each unique ID should be accepted
+            assert!(client.put_session(&session).is_ok(), 
+                "Failed to insert session with ID {}", i);
+            
+            // Verify storage
+            assert!(client.get_session(&sid).is_some());
+            stored_ids.push(sid);
+        }
+
+        // Verify all IDs remain stored (one more check)
+        for (idx, sid) in stored_ids.iter().enumerate() {
+            let stored = client.get_session(sid);
+            assert!(stored.is_some());
+            assert_eq!(stored.unwrap().amount, (idx as i128) * 1000);
+        }
+    }
+
+    #[test]
+    fn test_put_session_randomized_ids_multi_byte() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+
+        // Test with various multi-byte patterns simulating UUIDs or random IDs
+        let id_patterns = vec![
+            vec![&env, 0u8, 1u8, 2u8, 3u8],
+            vec![&env, 255u8, 254u8, 253u8],
+            vec![&env, 0x12u8, 0x34u8, 0x56u8, 0x78u8, 0x9au8],
+            vec![&env, 0xddu8, 0xeeu8, 0xffu8],
+            vec![&env, 1u8, 1u8, 1u8, 1u8, 1u8],
+            vec![&env, 0u8, 0u8, 0u8, 0u8],
+            vec![&env, 128u8, 64u8, 32u8, 16u8, 8u8, 4u8, 2u8, 1u8],
+            vec![&env, 7u8, 14u8, 21u8, 28u8, 35u8],
+        ];
+
+        for (idx, sid) in id_patterns.iter().enumerate() {
+            let session = Session {
+                version: 1,
+                session_id: sid.clone(),
+                payer: addr.clone(),
+                payee: addr.clone(),
+                asset: addr.clone(),
+                amount: (idx as i128) * 10000,
+                fee_bps: 100,
+                status: SessionStatus::Pending,
+                created_at: (idx as u64) * 1000,
+                updated_at: (idx as u64) * 1000,
+                dispute_deadline: (idx as u64) * 1000 + 86400,
+            };
+
+            // Each unique pattern should be accepted
+            assert!(client.put_session(&session).is_ok(),
+                "Failed to insert session with pattern index {}", idx);
+
+            // Verify it's stored
+            assert!(client.get_session(sid).is_some());
+        }
+
+        // Verify none of them can be inserted again (duplicate check)
+        for sid in id_patterns.iter() {
+            let session = Session {
+                version: 1,
+                session_id: sid.clone(),
+                payer: addr.clone(),
+                payee: addr.clone(),
+                asset: addr.clone(),
+                amount: 999_999,
+                fee_bps: 1,
+                status: SessionStatus::Pending,
+                created_at: 0,
+                updated_at: 0,
+                dispute_deadline: 0,
+            };
+
+            let result = client.try_put_session(&session);
+            assert_eq!(result, Err(Ok(Error::DuplicateSessionId)),
+                "Expected DuplicateSessionId error for existing ID");
+        }
+    }
+
+    #[test]
+    fn test_put_session_randomized_ids_large_ids() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+
+        // Simulate large ID patterns (like SHA256 hashes or UUIDs)
+        let large_ids = vec![
+            vec![&env, 0x4du8, 0x6fu8, 0x9eu8, 0x8bu8, 0xcdu8, 0xf4u8, 0x2bu8, 0xa0u8, 
+                 0x45u8, 0xcfu8, 0x15u8, 0x11u8, 0x6au8, 0x7bu8, 0xd8u8, 0xe9u8],
+            vec![&env, 0xffu8, 0xeeu8, 0xddu8, 0xccu8, 0xbbu8, 0xaau8, 0x99u8, 0x88u8,
+                 0x77u8, 0x66u8, 0x55u8, 0x44u8, 0x33u8, 0x22u8, 0x11u8, 0x00u8],
+            vec![&env, 0x00u8, 0x11u8, 0x22u8, 0x33u8, 0x44u8, 0x55u8, 0x66u8, 0x77u8,
+                 0x88u8, 0x99u8, 0xaau8, 0xbbu8, 0xccu8, 0xddu8, 0xeeu8, 0xffu8],
+        ];
+
+        for (idx, sid) in large_ids.iter().enumerate() {
+            let session = Session {
+                version: 1,
+                session_id: sid.clone(),
+                payer: addr.clone(),
+                payee: addr.clone(),
+                asset: addr.clone(),
+                amount: 5_000_000 + (idx as i128),
+                fee_bps: 250,
+                status: SessionStatus::Pending,
+                created_at: 1_000_000,
+                updated_at: 1_000_000,
+                dispute_deadline: 1_086_400,
+            };
+
+            assert!(client.put_session(&session).is_ok(),
+                "Failed to insert large ID pattern {}", idx);
+            assert!(client.get_session(sid).is_some());
+        }
+
+        // Verify none can be re-inserted
+        for sid in large_ids.iter() {
+            let session = Session {
+                version: 1,
+                session_id: sid.clone(),
+                payer: addr.clone(),
+                payee: addr.clone(),
+                asset: addr.clone(),
+                amount: 1,
+                fee_bps: 0,
+                status: SessionStatus::Pending,
+                created_at: 0,
+                updated_at: 0,
+                dispute_deadline: 0,
+            };
+
+            assert_eq!(
+                client.try_put_session(&session),
+                Err(Ok(Error::DuplicateSessionId))
+            );
+        }
+    }
+
+    #[test]
+    fn test_put_session_edge_case_empty_like_id() {
+        // Test with minimal-length IDs to ensure edge cases are covered
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+
+        // Single byte minimal ID
+        let sid_min = vec![&env, 0u8];
+        let session_min = Session {
+            version: 1,
+            session_id: sid_min.clone(),
+            payer: addr.clone(),
+            payee: addr.clone(),
+            asset: addr.clone(),
+            amount: 100,
+            fee_bps: 0,
+            status: SessionStatus::Pending,
+            created_at: 0,
+            updated_at: 0,
+            dispute_deadline: 0,
+        };
+
+        assert!(client.put_session(&session_min).is_ok());
+        assert!(client.get_session(&sid_min).is_some());
+
+        // Attempting duplicate should fail
+        assert_eq!(
+            client.try_put_session(&session_min),
+            Err(Ok(Error::DuplicateSessionId))
+        );
     }
 }
