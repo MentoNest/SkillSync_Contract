@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, IntoVal,
-    Symbol, Vec,
+    Symbol, Vec, token,
 };
 
 pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
@@ -100,6 +100,9 @@ pub enum Error {
     Unauthorized = 4,
     InvalidTreasuryAddress = 5,
     DuplicateSessionId = 6,
+    InvalidAmount = 7,
+    InsufficientBalance = 8,
+    TransferError = 9,
 }
 
 #[contractimpl]
@@ -232,6 +235,127 @@ impl SkillSyncContract {
         env.storage().instance().set(&DataKey::Treasury, &new_addr);
         env.events()
             .publish((Symbol::new(&env, "TreasuryUpdated"),), (old, new_addr));
+        Ok(())
+    }
+
+    /// Locks funds in escrow for a mentorship session.
+    ///
+    /// This function:
+    /// 1. Validates all inputs (nonzero amount, distinct parties, unique session_id)
+    /// 2. Checks and reserves platform fee based on fee_bps
+    /// 3. Transfers total funds (amount + fee) from payer to contract's escrow
+    /// 4. Creates and stores a Session struct with status=Locked
+    /// 5. Emits a FundsLocked event
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    /// * `session_id` - Globally unique session identifier (must not already exist)
+    /// * `payer` - Address of the mentor/service provider (sends funds)
+    /// * `payee` - Address of the student/service receiver (receives funds on completion)
+    /// * `asset` - Token address (must be a valid Soroban token contract)
+    /// * `amount` - Session/service amount in stroops (must be > 0)
+    /// * `fee_bps` - Platform fee in basis points (1 bps = 0.01%, max 10000 = 100%)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if funds were successfully locked
+    /// - `Err(Error::DuplicateSessionId)` if session_id already exists
+    /// - `Err(Error::InvalidAmount)` if amount is zero or negative
+    /// - `Err(Error::InsufficientBalance)` if payer doesn't have enough balance
+    /// - `Err(Error::TransferError)` if token transfer fails
+    ///
+    /// # Events
+    ///
+    /// Emits `FundsLocked(session_id, payer, payee, amount, fee)` upon success
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let session_id = vec![&env, 0x01, 0x02, 0x03];
+    /// let result = contract.lock_funds(
+    ///     &env,
+    ///     &session_id,
+    ///     &mentor_addr,
+    ///     &student_addr,
+    ///     &token_addr,
+    ///     10_000_000_i128,  // 10 USDC (6 decimals)
+    ///     250_u32            // 2.5% fee
+    /// );
+    /// ```
+    pub fn lock_funds(
+        env: Env,
+        session_id: Vec<u8>,
+        payer: Address,
+        payee: Address,
+        asset: Address,
+        amount: i128,
+        fee_bps: u32,
+    ) -> Result<(), Error> {
+        // Validate inputs
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if payer == payee {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Get current timestamp and dispute window
+        let now = env.ledger().timestamp();
+        let dispute_window = Self::get_dispute_window(env.clone());
+        let dispute_deadline = now + dispute_window;
+
+        // Calculate platform fee
+        // fee = amount * fee_bps / 10000
+        // Using checked arithmetic to prevent overflow
+        let fee = amount
+            .checked_mul(fee_bps as i128)
+            .ok_or(Error::TransferError)?
+            .checked_div(10000)
+            .ok_or(Error::TransferError)?;
+
+        let total_amount = amount
+            .checked_add(fee)
+            .ok_or(Error::TransferError)?;
+
+        // Create token client for the asset
+        let token_client = token::Client::new(&env, &asset);
+
+        // Check payer's balance before transfer
+        let payer_balance = token_client.balance(&payer);
+        if payer_balance < total_amount {
+            return Err(Error::InsufficientBalance);
+        }
+
+        // Create session struct
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: asset.clone(),
+            amount,
+            fee_bps,
+            status: SessionStatus::Locked,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline,
+        };
+
+        // Store session (this also checks for duplicate session_id)
+        Self::put_session(env.clone(), session)?;
+
+        // Transfer funds from payer to contract
+        let contract_id = env.current_contract_address();
+        token_client.transfer(&payer, &contract_id, &total_amount);
+
+        // Emit FundsLocked event
+        env.events().publish(
+            (Symbol::new(&env, "FundsLocked"),),
+            (session_id, payer, payee, amount, fee),
+        );
+
         Ok(())
     }
 }
