@@ -92,6 +92,9 @@ pub struct Session {
     pub created_at: u64,
     pub updated_at: u64,
     pub dispute_deadline: u64,
+    pub payer_approved: bool,
+    pub payee_approved: bool,
+    pub approved_at: u64,
 }
 
 const VERSION: u32 = 1;
@@ -109,14 +112,12 @@ pub enum Error {
     InvalidAmount = 7,
     InsufficientBalance = 8,
     TransferError = 9,
-<<<<<<< feat/platformFees
     InvalidFeeBps = 10,
     SessionNotFound = 11,
-=======
-    SessionNotFound = 10,
-    InvalidSessionStatus = 11,
     DisputeWindowNotElapsed = 12,
->>>>>>> main
+    NotAuthorizedParty = 13,
+    AlreadyApproved = 14,
+    InvalidSessionStatus = 15,
 }
 
 #[contractimpl]
@@ -334,6 +335,9 @@ impl SkillSyncContract {
             created_at: now,
             updated_at: now,
             dispute_deadline,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         // Store session (this also checks for duplicate session_id)
@@ -396,9 +400,11 @@ impl SkillSyncContract {
             return Err(Error::InvalidSessionStatus);
         }
 
-        // Check dispute window has elapsed
+        // Check dispute window has elapsed OR both parties approved
         let now = env.ledger().timestamp();
-        if now < session.dispute_deadline {
+        let both_approved = session.payer_approved && session.payee_approved;
+        
+        if !both_approved && now < session.dispute_deadline {
             return Err(Error::DisputeWindowNotElapsed);
         }
 
@@ -435,6 +441,100 @@ impl SkillSyncContract {
         env.events().publish(
             (Symbol::new(&env, "SessionCompleted"),),
             (session_id, session.payee.clone(), session.amount, fee),
+        );
+
+        Ok(())
+    }
+
+    /// Approves a session by one of the parties (payer or payee).
+    ///
+    /// This function:
+    /// 1. Validates session exists and status is Locked
+    /// 2. Verifies caller is either payer or payee
+    /// 3. Prevents duplicate approvals by the same party
+    /// 4. Marks the appropriate approval flag (payer_approved or payee_approved)
+    /// 5. If both parties approve, sets approved_at timestamp
+    /// 6. Emits SessionApproved event
+    ///
+    /// When both parties approve, the session can be completed early
+    /// (before dispute window ends) via complete_session().
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    /// * `session_id` - The unique session identifier
+    /// * `approver` - Address of the party approving (must be payer or payee)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if approval was successfully recorded
+    /// - `Err(Error::SessionNotFound)` if session doesn't exist
+    /// - `Err(Error::InvalidSessionStatus)` if session status is not Locked
+    /// - `Err(Error::NotAuthorizedParty)` if approver is neither payer nor payee
+    /// - `Err(Error::AlreadyApproved)` if this party already approved
+    ///
+    /// # Events
+    ///
+    /// Emits `SessionApproved(session_id, approver, both_approved)` upon success
+    pub fn approve_session(
+        env: Env,
+        session_id: Vec<u8>,
+        approver: Address,
+    ) -> Result<(), Error> {
+        // Require approver authorization
+        approver.require_auth();
+
+        // Retrieve session
+        let mut session = Self::get_session(env.clone(), session_id.clone())
+            .ok_or(Error::SessionNotFound)?;
+
+        // Validate session status is Locked
+        if session.status != SessionStatus::Locked {
+            return Err(Error::InvalidSessionStatus);
+        }
+
+        // Determine which party is approving
+        let is_payer = approver == session.payer;
+        let is_payee = approver == session.payee;
+
+        if !is_payer && !is_payee {
+            return Err(Error::NotAuthorizedParty);
+        }
+
+        // Check for duplicate approval
+        if is_payer && session.payer_approved {
+            return Err(Error::AlreadyApproved);
+        }
+        if is_payee && session.payee_approved {
+            return Err(Error::AlreadyApproved);
+        }
+
+        // Mark approval
+        if is_payer {
+            session.payer_approved = true;
+        }
+        if is_payee {
+            session.payee_approved = true;
+        }
+
+        // Update timestamp
+        let now = env.ledger().timestamp();
+        session.updated_at = now;
+
+        // If both parties approved, set approved_at
+        let both_approved = session.payer_approved && session.payee_approved;
+        if both_approved && session.approved_at == 0 {
+            session.approved_at = now;
+        }
+
+        // Save updated session
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &session);
+
+        // Emit SessionApproved event
+        env.events().publish(
+            (Symbol::new(&env, "SessionApproved"),),
+            (session_id, approver, both_approved),
         );
 
         Ok(())
@@ -679,6 +779,9 @@ mod tests {
             created_at,
             updated_at: created_at,
             dispute_deadline: created_at + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         client.put_session(&s);
@@ -725,6 +828,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         let s2 = Session { session_id: sid2.clone(), ..s1.clone() };
@@ -805,6 +911,31 @@ mod tests {
         let contract_id = env.register_contract(None, SkillSyncContract);
         let client = SkillSyncContractClient::new(&env, &contract_id);
 
+        let addr = Address::generate(&env);
+        let sid = vec![&env, 9u8, 9u8];
+
+        // Simulate older-version session (version 0)
+        let old = Session {
+            version: 0,
+            session_id: sid.clone(),
+            payer: addr.clone(),
+            payee: addr.clone(),
+            asset: addr.clone(),
+            amount: 0,
+            fee_bps: 0,
+            status: SessionStatus::Pending,
+            created_at: 0,
+            updated_at: 0,
+            dispute_deadline: 0,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+        };
+
+        // store and ensure we can read back (decode) older versions
+        client.put_session(&old).unwrap();
+        let got = client.get_session(&sid).unwrap();
+        assert_eq!(got.version, 0);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
 
@@ -835,6 +966,9 @@ mod tests {
             created_at: 1000,
             updated_at: 1000,
             dispute_deadline: 86400,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         // First insertion should succeed
@@ -867,6 +1001,9 @@ mod tests {
             created_at: 5000,
             updated_at: 5000,
             dispute_deadline: 91400,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         let mut session2 = session1.clone();
@@ -903,6 +1040,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         let session2 = Session { session_id: sid2.clone(), ..session1.clone() };
@@ -940,6 +1080,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         // First insertion succeeds
@@ -982,6 +1125,9 @@ mod tests {
                 created_at: i as u64,
                 updated_at: i as u64,
                 dispute_deadline: (i as u64) + 86400,
+                payer_approved: false,
+                payee_approved: false,
+                approved_at: 0,
             };
 
             client.put_session(&session);
@@ -1025,6 +1171,9 @@ mod tests {
                 created_at: (idx as u64) * 1000,
                 updated_at: (idx as u64) * 1000,
                 dispute_deadline: (idx as u64) * 1000 + 86400,
+                payer_approved: false,
+                payee_approved: false,
+                approved_at: 0,
             };
 
             // Each unique pattern should be accepted
@@ -1048,6 +1197,9 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 dispute_deadline: 0,
+                payer_approved: false,
+                payee_approved: false,
+                approved_at: 0,
             };
 
             let result = client.try_put_session(&session);
@@ -1087,6 +1239,9 @@ mod tests {
                 created_at: 1_000_000,
                 updated_at: 1_000_000,
                 dispute_deadline: 1_086_400,
+                payer_approved: false,
+                payee_approved: false,
+                approved_at: 0,
             };
 
             client.put_session(&session);
@@ -1107,6 +1262,9 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 dispute_deadline: 0,
+                payer_approved: false,
+                payee_approved: false,
+                approved_at: 0,
             };
 
             assert_eq!(
@@ -1139,6 +1297,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         client.put_session(&session_min);
@@ -1803,6 +1964,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         client.put_session(&session).unwrap();
@@ -1836,6 +2000,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         client.put_session(&session).unwrap();
@@ -2159,5 +2326,422 @@ mod tests {
             }
         }
         assert!(found_caller_auth, "Caller authentication not found");
+    }
+}
+
+    // Tests for approve_session functionality
+    // ========================================
+
+    #[test]
+    fn test_approve_session_payer_approval() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint and lock funds
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        token_client.mint(&payer, &(amount + fee));
+
+        let session_id = vec![&env, 240u8, 241u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Payer approves
+        let result = client.approve_session(&session_id, &payer);
+        assert!(result.is_ok());
+
+        // Verify approval recorded
+        let session = client.get_session(&session_id).unwrap();
+        assert!(session.payer_approved);
+        assert!(!session.payee_approved);
+        assert_eq!(session.approved_at, 0); // Not both approved yet
+    }
+
+    #[test]
+    fn test_approve_session_payee_approval() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint and lock funds
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        token_client.mint(&payer, &(amount + fee));
+
+        let session_id = vec![&env, 242u8, 243u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Payee approves
+        let result = client.approve_session(&session_id, &payee);
+        assert!(result.is_ok());
+
+        // Verify approval recorded
+        let session = client.get_session(&session_id).unwrap();
+        assert!(!session.payer_approved);
+        assert!(session.payee_approved);
+        assert_eq!(session.approved_at, 0); // Not both approved yet
+    }
+
+    #[test]
+    fn test_approve_session_both_parties() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint and lock funds
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        token_client.mint(&payer, &(amount + fee));
+
+        let session_id = vec![&env, 244u8, 245u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Both parties approve
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+
+        // Verify both approvals recorded and approved_at set
+        let session = client.get_session(&session_id).unwrap();
+        assert!(session.payer_approved);
+        assert!(session.payee_approved);
+        assert!(session.approved_at > 0);
+    }
+
+    #[test]
+    fn test_approve_session_duplicate_approval() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint and lock funds
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        token_client.mint(&payer, &(amount + fee));
+
+        let session_id = vec![&env, 246u8, 247u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // First approval succeeds
+        client.approve_session(&session_id, &payer);
+
+        // Second approval by same party fails
+        let result = client.try_approve_session(&session_id, &payer);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Ok(Error::AlreadyApproved));
+    }
+
+    #[test]
+    fn test_approve_session_unauthorized_party() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let unauthorized = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint and lock funds
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        token_client.mint(&payer, &(amount + fee));
+
+        let session_id = vec![&env, 248u8, 249u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Unauthorized party tries to approve
+        let result = client.try_approve_session(&session_id, &unauthorized);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Ok(Error::NotAuthorizedParty));
+    }
+
+    #[test]
+    fn test_approve_session_nonexistent_session() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let approver = Address::generate(&env);
+        let session_id = vec![&env, 250u8, 251u8];
+
+        let result = client.try_approve_session(&session_id, &approver);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Ok(Error::SessionNotFound));
+    }
+
+    #[test]
+    fn test_approve_session_invalid_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        let addr = Address::generate(&env);
+        let session_id = vec![&env, 252u8, 253u8];
+
+        // Create a completed session
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: addr.clone(),
+            payee: addr.clone(),
+            asset: addr.clone(),
+            amount: 1_000_000,
+            fee_bps: 250,
+            status: SessionStatus::Completed,
+            created_at: 0,
+            updated_at: 0,
+            dispute_deadline: 0,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+        };
+
+        client.put_session(&session).unwrap();
+
+        let result = client.try_approve_session(&session_id, &addr);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Ok(Error::InvalidSessionStatus));
+    }
+
+    #[test]
+    fn test_approve_session_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint and lock funds
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        token_client.mint(&payer, &(amount + fee));
+
+        let session_id = vec![&env, 254u8, 255u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Approve
+        client.approve_session(&session_id, &payer);
+
+        // Verify SessionApproved event was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("SessionApproved".to_string()) {
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "SessionApproved event not found");
+    }
+
+    #[test]
+    fn test_complete_session_with_both_approvals_early() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint and lock funds
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        token_client.mint(&payer, &(amount + fee));
+
+        let session_id = vec![&env, 1u8, 2u8, 3u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Both parties approve
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+
+        // Complete immediately (before dispute window) - should succeed
+        let result = client.complete_session(&session_id, &payer);
+        assert!(result.is_ok());
+
+        // Verify completion
+        let session = client.get_session(&session_id).unwrap();
+        assert_eq!(session.status, SessionStatus::Completed);
+
+        // Verify funds transferred
+        assert_eq!(token_client.balance(&payee), amount);
+        assert_eq!(token_client.balance(&treasury), fee);
+    }
+
+    #[test]
+    fn test_complete_session_without_approvals_before_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint and lock funds
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        token_client.mint(&payer, &(amount + fee));
+
+        let session_id = vec![&env, 4u8, 5u8, 6u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Try to complete immediately without approvals - should fail
+        let result = client.try_complete_session(&session_id, &payer);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Ok(Error::DisputeWindowNotElapsed));
+    }
+
+    #[test]
+    fn test_complete_session_with_one_approval_before_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint and lock funds
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        token_client.mint(&payer, &(amount + fee));
+
+        let session_id = vec![&env, 7u8, 8u8, 9u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Only payer approves
+        client.approve_session(&session_id, &payer);
+
+        // Try to complete with only one approval - should fail
+        let result = client.try_complete_session(&session_id, &payer);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Ok(Error::DisputeWindowNotElapsed));
     }
 }
