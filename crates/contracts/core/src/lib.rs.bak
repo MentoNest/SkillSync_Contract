@@ -1868,6 +1868,7 @@ mod tests {
             ]
         );
     }
+}
 
     // Tests for complete_session functionality
     // =========================================
@@ -2326,6 +2327,7 @@ mod tests {
         }
         assert!(found_caller_auth, "Caller authentication not found");
     }
+}
 
     // Tests for approve_session functionality
     // ========================================
