@@ -2,13 +2,15 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes, Env,
-    Symbol, token,
+    Symbol, Vec, Map, token,
 };
 
 pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
 pub const DISPUTE_WINDOW_MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_DISPUTE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const PLATFORM_FEE_MAX_BPS: u32 = 1000; // 10%
+pub const ESCROW_DURATION_SECONDS: u64 = 7 * 24 * 60 * 60; // Default 7 days
+pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 #[contract]
 pub struct SkillSyncContract;
@@ -22,6 +24,10 @@ enum DataKey {
     Treasury,
     Version,
     Session(Bytes),
+    // Expiry index: groups sessions by expiry day bucket (timestamp / SECONDS_PER_DAY)
+    ExpiryIndex(u64),
+    // Track which day buckets have been processed for pagination
+    LastProcessedExpiryBucket,
 }
 
 #[contracttype]
@@ -92,6 +98,7 @@ pub struct Session {
     pub created_at: u64,
     pub updated_at: u64,
     pub dispute_deadline: u64,
+    pub expires_at: u64, // Timestamp when escrow can be auto-refunded
     pub payer_approved: bool,
     pub payee_approved: bool,
     pub approved_at: u64,
@@ -118,6 +125,9 @@ pub enum Error {
     NotAuthorizedParty = 13,
     AlreadyApproved = 14,
     InvalidSessionStatus = 15,
+    SessionNotExpired = 16,      // Session has not yet expired
+    RefundFailed = 17,           // Failed to refund escrow
+    NothingToSweep = 18,         // No expired sessions to sweep
 }
 
 #[contractimpl]
@@ -299,6 +309,7 @@ impl SkillSyncContract {
         let now = env.ledger().timestamp();
         let dispute_window = Self::get_dispute_window(env.clone());
         let dispute_deadline = now + dispute_window;
+        let expires_at = now + ESCROW_DURATION_SECONDS; // Default escrow duration
 
         // Calculate platform fee
         // fee = amount * fee_bps / 10000
@@ -335,13 +346,17 @@ impl SkillSyncContract {
             created_at: now,
             updated_at: now,
             dispute_deadline,
+            expires_at,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
         };
 
         // Store session (this also checks for duplicate session_id)
-        Self::put_session(env.clone(), session)?;
+        Self::put_session(env.clone(), session.clone())?;
+
+        // Add session to expiry index
+        Self::add_to_expiry_index(env.clone(), session_id.clone(), expires_at)?;
 
         // Transfer funds from payer to contract
         let contract_id = env.current_contract_address();
@@ -436,6 +451,9 @@ impl SkillSyncContract {
         
         let key = DataKey::Session(session_id.clone());
         env.storage().persistent().set(&key, &session);
+
+        // Remove from expiry index since session is completed
+        Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
 
         // Emit SessionCompleted event
         env.events().publish(
@@ -538,6 +556,199 @@ impl SkillSyncContract {
         );
 
         Ok(())
+    }
+
+    /// Adds a session to the expiry index for timeout tracking.
+    /// Sessions are grouped by day bucket for efficient pagination.
+    fn add_to_expiry_index(env: Env, session_id: Bytes, expires_at: u64) -> Result<(), Error> {
+        // Calculate day bucket (expires_at / seconds per day)
+        let day_bucket = expires_at / SECONDS_PER_DAY;
+        let key = DataKey::ExpiryIndex(day_bucket);
+
+        // Get or create the list of session IDs for this bucket
+        let mut session_ids: Vec<Bytes> = env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Add session_id if not already present
+        if !session_ids.contains(&session_id) {
+            session_ids.push_back(session_id);
+            env.storage().persistent().set(&key, &session_ids);
+        }
+
+        Ok(())
+    }
+
+    /// Removes a session from the expiry index.
+    fn remove_from_expiry_index(env: Env, session_id: Bytes, expires_at: u64) -> Result<(), Error> {
+        let day_bucket = expires_at / SECONDS_PER_DAY;
+        let key = DataKey::ExpiryIndex(day_bucket);
+
+        if let Some(mut session_ids) = env.storage()
+            .persistent()
+            .get::<_, Vec<Bytes>>(&key) 
+        {
+            // Create new vec without the session_id
+            let mut new_ids = Vec::new(&env);
+            for i in 0..session_ids.len() {
+                let id = session_ids.get(i).unwrap();
+                if id != session_id {
+                    new_ids.push_back(id);
+                }
+            }
+            
+            if new_ids.is_empty() {
+                env.storage().persistent().remove(&key);
+            } else {
+                env.storage().persistent().set(&key, &new_ids);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sweeps expired escrows and refunds funds to payers.
+    /// 
+    /// This function:
+    /// 1. Gets the current ledger timestamp
+    /// 2. Iterates over expiry day buckets up to the current day
+    /// 3. For each expired session, calls internal_refund
+    /// 4. Returns the number of sessions processed
+    /// 
+    /// The `batch` parameter limits how many sessions to process in one call
+    /// to stay within budget limits.
+    /// 
+    /// Anyone can call this function - it's permissionless for automation.
+    pub fn sweep_timeouts(env: Env, batch: u32) -> Result<u32, Error> {
+        let now = env.ledger().timestamp();
+        let current_day_bucket = now / SECONDS_PER_DAY;
+        
+        // Get the last processed bucket (start from 0 if not set)
+        let last_processed = env.storage()
+            .instance()
+            .get::<_, u64>(&DataKey::LastProcessedExpiryBucket)
+            .unwrap_or(0);
+
+        let mut processed: u32 = 0;
+        let mut current_bucket = last_processed;
+
+        // Iterate through day buckets up to current day, respecting batch limit
+        while current_bucket < current_day_bucket && processed < batch {
+            let key = DataKey::ExpiryIndex(current_bucket);
+            
+            if let Some(session_ids) = env.storage()
+                .persistent()
+                .get::<_, Vec<Bytes>>(&key) 
+            {
+                // Process each session in this bucket
+                for i in 0..session_ids.len() {
+                    if processed >= batch {
+                        break;
+                    }
+
+                    let session_id = session_ids.get(i).unwrap();
+                    
+                    // Try to refund this session if it exists and is expired
+                    if let Some(session) = Self::get_session(env.clone(), session_id.clone()) {
+                        // Check if session is actually expired (status is Locked and past expires_at)
+                        if session.status == SessionStatus::Locked && session.expires_at <= now {
+                            // Attempt refund - internal_refund will handle idempotency
+                            match Self::internal_refund(env.clone(), session_id.clone()) {
+                                Ok(_) => {
+                                    processed += 1;
+                                }
+                                Err(e) => {
+                                    // Log error but continue with next session
+                                    // This ensures partial success even if one fails
+                                    if e != Error::SessionNotFound && 
+                                       e != Error::InvalidSessionStatus {
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            current_bucket += 1;
+        }
+
+        // Update the last processed bucket
+        if current_bucket > last_processed {
+            // Only update if we made progress
+            let new_last = if processed >= batch {
+                // If we hit batch limit, stay at current bucket for next call
+                current_bucket - 1
+            } else {
+                current_bucket
+            };
+            env.storage()
+                .instance()
+                .set(&DataKey::LastProcessedExpiryBucket, &new_last);
+        }
+
+        Ok(processed)
+    }
+
+    /// Internal function to refund an expired escrow.
+    /// Transfers funds back to the payer.
+    /// 
+    /// This function is idempotent - calling it multiple times on the same
+    /// session will not cause issues (the session will be marked as Cancelled
+    /// after first successful refund).
+    fn internal_refund(env: Env, session_id: Bytes) -> Result<i128, Error> {
+        // Retrieve session
+        let session = Self::get_session(env.clone(), session_id.clone())
+            .ok_or(Error::SessionNotFound)?;
+
+        // Only refund Locked sessions that have expired
+        if session.status != SessionStatus::Locked {
+            return Err(Error::InvalidSessionStatus);
+        }
+
+        let now = env.ledger().timestamp();
+        if session.expires_at > now {
+            return Err(Error::SessionNotExpired);
+        }
+
+        // Calculate total amount to refund (amount + fee)
+        let fee = session.amount
+            .checked_mul(session.fee_bps as i128)
+            .ok_or(Error::TransferError)?
+            .checked_div(10000)
+            .ok_or(Error::TransferError)?;
+
+        let total_refund = session.amount
+            .checked_add(fee)
+            .ok_or(Error::TransferError)?;
+
+        // Create token client
+        let token_client = token::Client::new(&env, &session.asset);
+        let contract_id = env.current_contract_address();
+
+        // Transfer refund to payer
+        token_client.transfer(&contract_id, &session.payer, &total_refund);
+
+        // Update session status to Cancelled
+        let mut updated_session = session.clone();
+        updated_session.status = SessionStatus::Cancelled;
+        updated_session.updated_at = now;
+
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &updated_session);
+
+        // Remove from expiry index
+        Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
+
+        // Emit TimeoutRefunded event
+        env.events().publish(
+            (Symbol::new(&env, "TimeoutRefunded"),),
+            (session_id, session.payer, total_refund),
+        );
+
+        Ok(total_refund)
     }
 }
 
@@ -779,6 +990,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             dispute_deadline: created_at + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: created_at + ESCROW_DURATION_SECONDS,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -828,6 +1040,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            expires_at: 0,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -866,6 +1079,10 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            expires_at: 0,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
         };
 
         client.put_session(&old);
@@ -927,6 +1144,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            expires_at: 0,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -966,6 +1184,7 @@ mod tests {
             created_at: 1000,
             updated_at: 1000,
             dispute_deadline: 86400,
+            expires_at: 1000 + ESCROW_DURATION_SECONDS,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -1001,6 +1220,7 @@ mod tests {
             created_at: 5000,
             updated_at: 5000,
             dispute_deadline: 91400,
+            expires_at: 5000 + ESCROW_DURATION_SECONDS,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -1040,6 +1260,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            expires_at: 0,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -1080,6 +1301,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            expires_at: 0,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -1125,6 +1347,7 @@ mod tests {
                 created_at: i as u64,
                 updated_at: i as u64,
                 dispute_deadline: (i as u64) + 86400,
+                expires_at: (i as u64) + ESCROW_DURATION_SECONDS,
                 payer_approved: false,
                 payee_approved: false,
                 approved_at: 0,
@@ -1171,6 +1394,7 @@ mod tests {
                 created_at: (idx as u64) * 1000,
                 updated_at: (idx as u64) * 1000,
                 dispute_deadline: (idx as u64) * 1000 + 86400,
+                expires_at: (idx as u64) * 1000 + ESCROW_DURATION_SECONDS,
                 payer_approved: false,
                 payee_approved: false,
                 approved_at: 0,
@@ -1197,6 +1421,7 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 dispute_deadline: 0,
+                expires_at: 0,
                 payer_approved: false,
                 payee_approved: false,
                 approved_at: 0,
@@ -1239,6 +1464,7 @@ mod tests {
                 created_at: 1_000_000,
                 updated_at: 1_000_000,
                 dispute_deadline: 1_086_400,
+                expires_at: 1_000_000 + ESCROW_DURATION_SECONDS,
                 payer_approved: false,
                 payee_approved: false,
                 approved_at: 0,
@@ -1262,6 +1488,7 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 dispute_deadline: 0,
+                expires_at: 0,
                 payer_approved: false,
                 payee_approved: false,
                 approved_at: 0,
@@ -1297,6 +1524,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            expires_at: 0,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -1963,6 +2191,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            expires_at: 0,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -1999,6 +2228,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             dispute_deadline: 0,
+            expires_at: 0,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -2741,5 +2971,380 @@ mod tests {
         let result = client.try_complete_session(&session_id, &payer);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), Ok(Error::DisputeWindowNotElapsed));
+    }
+
+    // Tests for sweep_timeouts (timeout-based refunds)
+    // =================================================
+
+    #[test]
+    fn test_sweep_timeouts_single_expired_session() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        token_client.mint(&payer, &total);
+
+        // Lock funds - this sets expires_at to created_at + 7 days
+        let session_id = vec![&env, 100u8, 101u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Verify session was created with Locked status
+        let session = client.get_session(&session_id).unwrap();
+        assert_eq!(session.status, SessionStatus::Locked);
+        assert!(session.expires_at > 0);
+
+        // Advance ledger time past the expiry
+        // expires_at = created_at + ESCROW_DURATION_SECONDS
+        let expiry_time = session.expires_at;
+        env.ledger().set_timestamp(expiry_time + 1);
+
+        // Sweep timeouts
+        let processed = client.sweep_timeouts(&10);
+        assert_eq!(processed, 1);
+
+        // Verify session is now Cancelled
+        let updated_session = client.get_session(&session_id).unwrap();
+        assert_eq!(updated_session.status, SessionStatus::Cancelled);
+
+        // Verify funds were refunded to payer
+        assert_eq!(token_client.balance(&payer), total);
+        assert_eq!(token_client.balance(&payee), 0);
+        assert_eq!(token_client.balance(&contract_id), 0);
+    }
+
+    #[test]
+    fn test_sweep_timeouts_non_expired_session_not_refunded() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        token_client.mint(&payer, &total);
+
+        // Lock funds
+        let session_id = vec![&env, 102u8, 103u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Get the expiry time
+        let session = client.get_session(&session_id).unwrap();
+        let expires_at = session.expires_at;
+
+        // Set time to just before expiry
+        env.ledger().set_timestamp(expires_at - 1);
+
+        // Try to sweep - should not refund
+        let processed = client.sweep_timeouts(&10);
+        assert_eq!(processed, 0);
+
+        // Verify session is still Locked
+        let updated_session = client.get_session(&session_id).unwrap();
+        assert_eq!(updated_session.status, SessionStatus::Locked);
+
+        // Verify funds are still locked
+        assert_eq!(token_client.balance(&payer), 0);
+        assert_eq!(token_client.balance(&contract_id), total);
+    }
+
+    #[test]
+    fn test_sweep_timeouts_multiple_expired_sessions() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup tokens
+        let payer1 = Address::generate(&env);
+        let payer2 = Address::generate(&env);
+        let payee1 = Address::generate(&env);
+        let payee2 = Address::generate(&env);
+        
+        let token_contract1 = env.register_stellar_asset_contract(payer1.clone());
+        let token_id1 = Address::from_contract_id(&env, &token_contract1);
+        let token_client1 = token::Client::new(&env, &token_id1);
+        
+        let token_contract2 = env.register_stellar_asset_contract(payer2.clone());
+        let token_id2 = Address::from_contract_id(&env, &token_contract2);
+        let token_client2 = token::Client::new(&env, &token_id2);
+
+        // Mint tokens
+        let amount = 500_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        
+        token_client1.mint(&payer1, &total);
+        token_client2.mint(&payer2, &total);
+
+        // Lock funds for multiple sessions
+        let session_id1 = vec![&env, 104u8, 105u8];
+        let session_id2 = vec![&env, 106u8, 107u8];
+        
+        client.lock_funds(&session_id1, &payer1, &payee1, &token_id1, &amount, &fee_bps);
+        client.lock_funds(&session_id2, &payer2, &payee2, &token_id2, &amount, &fee_bps);
+
+        // Get expiry times and advance past them
+        let session1 = client.get_session(&session_id1).unwrap();
+        let session2 = client.get_session(&session_id2).unwrap();
+        let max_expires = session1.expires_at.max(session2.expires_at);
+        env.ledger().set_timestamp(max_expires + 1);
+
+        // Sweep all
+        let processed = client.sweep_timeouts(&10);
+        assert_eq!(processed, 2);
+
+        // Verify both sessions are cancelled
+        let s1 = client.get_session(&session_id1).unwrap();
+        let s2 = client.get_session(&session_id2).unwrap();
+        assert_eq!(s1.status, SessionStatus::Cancelled);
+        assert_eq!(s2.status, SessionStatus::Cancelled);
+
+        // Verify funds refunded
+        assert_eq!(token_client1.balance(&payer1), total);
+        assert_eq!(token_client2.balance(&payer2), total);
+    }
+
+    #[test]
+    fn test_sweep_timeouts_batch_limit() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Create multiple expired sessions
+        let mut total = 0_i128;
+        let amount = 100_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let session_total = amount + fee;
+        
+        let mut session_ids: Vec<Vec<u8>> = Vec::new(&env);
+        
+        // Create 5 sessions
+        for i in 0..5u32 {
+            let payer = Address::generate(&env);
+            let payee = Address::generate(&env);
+            let token_contract = env.register_stellar_asset_contract(payer.clone());
+            let token_id = Address::from_contract_id(&env, &token_contract);
+            let token_client = token::Client::new(&env, &token_id);
+            
+            token_client.mint(&payer, &session_total);
+            
+            let session_id = vec![&env, (110 + i) as u8, (111 + i) as u8];
+            client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+            session_ids.push_back(session_id);
+            total += session_total;
+        }
+
+        // Get expiry and advance past it
+        let first_session = client.get_session(session_ids.get(0).unwrap()).unwrap();
+        env.ledger().set_timestamp(first_session.expires_at + 1);
+
+        // Sweep with batch size of 2
+        let processed1 = client.sweep_timeouts(&2);
+        assert_eq!(processed1, 2);
+
+        // Sweep remaining
+        let processed2 = client.sweep_timeouts(&10);
+        assert_eq!(processed2, 3);
+    }
+
+    #[test]
+    fn test_sweep_timeouts_idempotency() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        token_client.mint(&payer, &total);
+
+        // Lock funds
+        let session_id = vec![&env, 120u8, 121u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Advance past expiry
+        let session = client.get_session(&session_id).unwrap();
+        env.ledger().set_timestamp(session.expires_at + 1);
+
+        // First sweep
+        let processed1 = client.sweep_timeouts(&10);
+        assert_eq!(processed1, 1);
+
+        // Second sweep - should process 0 (idempotent)
+        let processed2 = client.sweep_timeouts(&10);
+        assert_eq!(processed2, 0);
+
+        // Verify funds still with payer (not refunded again)
+        assert_eq!(token_client.balance(&payer), total);
+    }
+
+    #[test]
+    fn test_sweep_timeouts_completed_session_not_refunded() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        token_client.mint(&payer, &(total * 2)); // Need extra for the second lock
+
+        // Lock funds
+        let session_id = vec![&env, 122u8, 123u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Complete the session normally
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+        client.complete_session(&session_id, &payer);
+
+        // Advance past what would have been expiry
+        let session = client.get_session(&session_id).unwrap();
+        let original_expires = session.expires_at;
+        env.ledger().set_timestamp(original_expires + 100);
+
+        // Try to sweep - should not affect completed session
+        let processed = client.sweep_timeouts(&10);
+        assert_eq!(processed, 0);
+
+        // Verify session is still Completed
+        let updated_session = client.get_session(&session_id).unwrap();
+        assert_eq!(updated_session.status, SessionStatus::Completed);
+    }
+
+    #[test]
+    fn test_sweep_timeouts_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.mint(&payer, &total);
+
+        // Lock funds
+        let session_id = vec![&env, 124u8, 125u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Advance past expiry
+        let session = client.get_session(&session_id).unwrap();
+        env.ledger().set_timestamp(session.expires_at + 1);
+
+        // Sweep
+        client.sweep_timeouts(&10);
+
+        // Verify TimeoutRefunded event was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("TimeoutRefunded".to_string()) {
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "TimeoutRefunded event not found");
     }
 }
