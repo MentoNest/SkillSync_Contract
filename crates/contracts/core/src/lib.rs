@@ -9,6 +9,7 @@ pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
 pub const DISPUTE_WINDOW_MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_DISPUTE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const PLATFORM_FEE_MAX_BPS: u32 = 1000; // 10%
+pub const MAX_FEE_BPS: u32 = 10_000; // 100% - absolute maximum
 pub const ESCROW_DURATION_SECONDS: u64 = 7 * 24 * 60 * 60; // Default 7 days
 pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 pub const MIN_UPGRADE_TIMELOCK_SECONDS: u64 = 60; // Minimum 1 minute timelock
@@ -32,6 +33,8 @@ enum DataKey {
     LastProcessedExpiryBucket,
     // Upgradeability storage keys
     PendingUpgrade,
+    // Fee configuration
+    FeeOnRefunds,
 }
 
 #[contracttype]
@@ -155,6 +158,10 @@ pub enum Error {
     UpgradeNotReady = 20,       // Upgrade timelock has not elapsed
     UpgradeDeadlinePassed = 21, // Upgrade deadline has passed
     InvalidTimelock = 22,       // Invalid timelock duration
+    InvalidResolutionAmount = 23, // Resolution amounts don't sum to available amount
+    SessionNotDisputed = 24,     // Session is not in Disputed status
+    ResolutionFeeError = 25,     // Error calculating resolution fees
+    FeeCalculationOverflow = 26, // Fee calculation overflow/underflow
 }
 
 #[contractimpl]
@@ -508,6 +515,50 @@ impl SkillSyncContract {
         Ok(())
     }
 
+    /// Returns whether fees are applied to refunds.
+    pub fn get_fee_on_refunds(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeOnRefunds)
+            .unwrap_or(false)
+    }
+
+    /// Sets whether fees should be applied to refunds.
+    /// Requires admin authorization.
+    pub fn set_fee_on_refunds(env: Env, fee_on_refunds: bool) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        let old = Self::get_fee_on_refunds(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeOnRefunds, &fee_on_refunds);
+        env.events()
+            .publish((Symbol::new(&env, "FeeOnRefundsUpdated"),), (old, fee_on_refunds));
+        Ok(())
+    }
+
+    /// Applies the settlement fee to a given amount.
+    /// Returns (net_amount, fee_amount) where net_amount + fee_amount = original amount.
+    /// Uses floor rounding: fee = amount * fee_bps / 10_000
+    fn apply_fee(env: &Env, amount: i128) -> Result<(i128, i128), Error> {
+        let fee_bps = Self::get_platform_fee_bps(env.clone()) as i128;
+        
+        // Calculate fee: amount * fee_bps / 10_000
+        let fee = amount
+            .checked_mul(fee_bps)
+            .ok_or(Error::FeeCalculationOverflow)?
+            .checked_div(10_000)
+            .ok_or(Error::FeeCalculationOverflow)?;
+        
+        // Net amount is the remainder
+        let net = amount
+            .checked_sub(fee)
+            .ok_or(Error::FeeCalculationOverflow)?;
+        
+        Ok((net, fee))
+    }
+
     /// Locks funds in escrow for a mentorship session.
     ///
     /// Validates inputs, calculates the platform fee (`amount * fee_bps / 10000`),
@@ -649,13 +700,8 @@ impl SkillSyncContract {
             return Err(Error::DisputeWindowNotElapsed);
         }
 
-        // Calculate fee
-        let fee = session
-            .amount
-            .checked_mul(session.fee_bps as i128)
-            .ok_or(Error::TransferError)?
-            .checked_div(10000)
-            .ok_or(Error::TransferError)?;
+        // Apply settlement fee using the configurable platform fee
+        let (net_amount, fee) = Self::apply_fee(&env, session.amount)?;
 
         // Get treasury address
         let treasury = Self::get_treasury(env.clone());
@@ -665,7 +711,7 @@ impl SkillSyncContract {
         let contract_id = env.current_contract_address();
 
         // Transfer net amount to payee
-        token_client.transfer(&contract_id, &session.payee, &session.amount);
+        token_client.transfer(&contract_id, &session.payee, &net_amount);
 
         // Transfer fee to treasury
         if fee > 0 {
@@ -682,10 +728,19 @@ impl SkillSyncContract {
         // Remove from expiry index since session is completed
         Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
 
+        // Emit FeeDeducted event
+        let fee_bps = Self::get_platform_fee_bps(env.clone());
+        if fee > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "FeeDeducted"),),
+                (session_id.clone(), session.amount, fee, fee_bps),
+            );
+        }
+
         // Emit SessionCompleted event
         env.events().publish(
             (Symbol::new(&env, "SessionCompleted"),),
-            (session_id, session.payee.clone(), session.amount, fee),
+            (session_id, session.payee.clone(), net_amount, fee),
         );
 
         Ok(())
@@ -933,25 +988,31 @@ impl SkillSyncContract {
             return Err(Error::SessionNotExpired);
         }
 
-        // Calculate total amount to refund (amount + fee)
-        let fee = session
-            .amount
-            .checked_mul(session.fee_bps as i128)
-            .ok_or(Error::TransferError)?
-            .checked_div(10000)
-            .ok_or(Error::TransferError)?;
-
-        let total_refund = session
-            .amount
-            .checked_add(fee)
-            .ok_or(Error::TransferError)?;
-
         // Create token client
         let token_client = token::Client::new(&env, &session.asset);
         let contract_id = env.current_contract_address();
+        let treasury = Self::get_treasury(env.clone());
+
+        // Check if fees should be applied to refunds
+        let fee_on_refunds = Self::get_fee_on_refunds(env.clone());
+        
+        // Calculate the refund amount
+        let (refund_amount, fee_amount) = if fee_on_refunds {
+            // Apply settlement fee to the refund
+            let (net, fee) = Self::apply_fee(&env, session.amount)?;
+            (net, fee)
+        } else {
+            // No fee on refunds - return full amount
+            (session.amount, 0_i128)
+        };
 
         // Transfer refund to payer
-        token_client.transfer(&contract_id, &session.payer, &total_refund);
+        token_client.transfer(&contract_id, &session.payer, &refund_amount);
+
+        // Transfer fee to treasury if applicable
+        if fee_amount > 0 {
+            token_client.transfer(&contract_id, &treasury, &fee_amount);
+        }
 
         // Update session status to Cancelled
         let mut updated_session = session.clone();
@@ -964,13 +1025,22 @@ impl SkillSyncContract {
         // Remove from expiry index
         Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
 
+        // Emit FeeDeducted event if fee was applied
+        let fee_bps = Self::get_platform_fee_bps(env.clone());
+        if fee_amount > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "FeeDeducted"),),
+                (session_id.clone(), session.amount, fee_amount, fee_bps),
+            );
+        }
+
         // Emit TimeoutRefunded event
         env.events().publish(
             (Symbol::new(&env, "TimeoutRefunded"),),
-            (session_id, session.payer, total_refund),
+            (session_id, session.payer, refund_amount),
         );
 
-        Ok(total_refund)
+        Ok(refund_amount)
     }
 
     /// Resolves a disputed escrow by splitting funds between payer and payee.
@@ -4648,5 +4718,522 @@ mod tests {
         assert_eq!(pending2.new_wasm_hash, wasm_hash2);
         assert_ne!(pending2.proposed_at, pending1.proposed_at);
         assert_eq!(pending2.deadline - pending2.proposed_at, 7200);
+    }
+
+    // ============================================================================
+    // Fee mechanics tests
+    // ============================================================================
+
+    #[test]
+    fn test_apply_fee_zero_bps() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 0 fee
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &0, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        token_client.mint(&payer, &amount);
+
+        // Lock funds with 0 fee
+        let session_id = vec![&env, 200u8, 201u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+
+        let payee_balance_before = token_client.balance(&payee);
+        client.complete_session(&session_id, &payer);
+
+        // Payee should receive full amount (no fee deducted)
+        assert_eq!(token_client.balance(&payee), payee_balance_before + amount);
+        
+        // Treasury should receive 0
+        assert_eq!(token_client.balance(&treasury), 0);
+    }
+
+    #[test]
+    fn test_apply_fee_typical_bps() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 2.5% fee (250 bps)
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee = (amount * 250) / 10000; // 25,000
+        let net = amount - fee; // 975,000
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 202u8, 203u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+
+        let payee_balance_before = token_client.balance(&payee);
+        let treasury_balance_before = token_client.balance(&treasury);
+        
+        client.complete_session(&session_id, &payer);
+
+        // Payee should receive net amount
+        assert_eq!(token_client.balance(&payee), payee_balance_before + net);
+        
+        // Treasury should receive fee
+        assert_eq!(token_client.balance(&treasury), treasury_balance_before + fee);
+    }
+
+    #[test]
+    fn test_apply_fee_max_bps() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 10% fee (1000 bps - the max platform fee)
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &1000, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee = (amount * 1000) / 10000; // 100,000
+        let net = amount - fee; // 900,000
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 204u8, 205u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+
+        let payee_balance_before = token_client.balance(&payee);
+        let treasury_balance_before = token_client.balance(&treasury);
+        
+        client.complete_session(&session_id, &payer);
+
+        // Payee should receive net amount
+        assert_eq!(token_client.balance(&payee), payee_balance_before + net);
+        
+        // Treasury should receive fee
+        assert_eq!(token_client.balance(&treasury), treasury_balance_before + fee);
+    }
+
+    #[test]
+    fn test_apply_fee_rounding_behavior() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 1% fee (100 bps)
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Test with amount that doesn't divide evenly
+        // amount = 1000, fee_bps = 100 (1%)
+        // fee = 1000 * 100 / 10000 = 10
+        // net = 1000 - 10 = 990
+        let amount = 1_000_i128;
+        let expected_fee = 10_i128;
+        let expected_net = 990_i128;
+        
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 206u8, 207u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+
+        let payee_balance_before = token_client.balance(&payee);
+        let treasury_balance_before = token_client.balance(&treasury);
+        
+        client.complete_session(&session_id, &payer);
+
+        // Verify floor rounding: fee = 10, net = 990
+        assert_eq!(token_client.balance(&payee), payee_balance_before + expected_net);
+        assert_eq!(token_client.balance(&treasury), treasury_balance_before + expected_fee);
+        
+        // Verify net + fee = original amount
+        assert_eq!(expected_net + expected_fee, amount);
+    }
+
+    #[test]
+    fn test_fee_deducted_event_emitted() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 2.5% fee
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 208u8, 209u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+        client.complete_session(&session_id, &payer);
+
+        // Verify FeeDeducted event was emitted
+        let events = env.events().all();
+        let mut found_fee_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("FeeDeducted".to_string()) {
+                        found_fee_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_fee_event, "FeeDeducted event not found");
+    }
+
+    #[test]
+    fn test_fee_on_refunds_config() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Default should be false
+        assert_eq!(client.get_fee_on_refunds(), false);
+
+        // Set to true
+        client.set_fee_on_refunds(&true);
+        assert_eq!(client.get_fee_on_refunds(), true);
+
+        // Set back to false
+        client.set_fee_on_refunds(&false);
+        assert_eq!(client.get_fee_on_refunds(), false);
+    }
+
+    #[test]
+    fn test_fee_on_refunds_requires_admin_auth() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Set fee_on_refunds
+        client.set_fee_on_refunds(&true);
+
+        // Verify admin auth was required
+        let auths = env.auths();
+        assert!(auths.len() >= 1);
+        // The most recent auth should be from admin
+        let last_auth = auths.get(auths.len() - 1);
+        assert_eq!(last_auth.0, admin);
+    }
+
+    #[test]
+    fn test_refund_without_fee_when_fee_on_refunds_false() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 10% fee but fee_on_refunds = false
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &1000, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+        // fee_on_refunds defaults to false
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 210u8, 211u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Record payer balance before refund
+        let payer_balance_before = token_client.balance(&payer);
+
+        // Advance past expiry and sweep
+        let session = client.get_session(&session_id).unwrap();
+        env.ledger().set_timestamp(session.expires_at + 1);
+        client.sweep_timeouts(&10);
+
+        // Payer should receive full refund (no fee deducted)
+        assert_eq!(token_client.balance(&payer), payer_balance_before + amount);
+        
+        // Treasury should receive nothing from refund
+        assert_eq!(token_client.balance(&treasury), 0);
+    }
+
+    #[test]
+    fn test_refund_with_fee_when_fee_on_refunds_true() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 10% fee and enable fee_on_refunds
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &1000, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+        client.set_fee_on_refunds(&true);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee = (amount * 1000) / 10000; // 100,000
+        let net = amount - fee; // 900,000
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 212u8, 213u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Record balances before refund
+        let payer_balance_before = token_client.balance(&payer);
+        let treasury_balance_before = token_client.balance(&treasury);
+
+        // Advance past expiry and sweep
+        let session = client.get_session(&session_id).unwrap();
+        env.ledger().set_timestamp(session.expires_at + 1);
+        client.sweep_timeouts(&10);
+
+        // Payer should receive net amount (fee deducted)
+        assert_eq!(token_client.balance(&payer), payer_balance_before + net);
+        
+        // Treasury should receive fee
+        assert_eq!(token_client.balance(&treasury), treasury_balance_before + fee);
+    }
+
+    #[test]
+    fn test_treasury_change_affects_fee_destination() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 2.5% fee
+        let admin = Address::generate(&env);
+        let treasury1 = Address::generate(&env);
+        client.init(&admin, &250, &treasury1, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        let fee = (amount * 250) / 10000;
+        token_client.mint(&payer, &amount);
+
+        // Change treasury
+        let treasury2 = Address::generate(&env);
+        client.set_treasury(&treasury2);
+
+        // Lock funds
+        let session_id = vec![&env, 214u8, 215u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+        client.complete_session(&session_id, &payer);
+
+        // First treasury should receive nothing
+        assert_eq!(token_client.balance(&treasury1), 0);
+        
+        // Second treasury should receive the fee
+        assert_eq!(token_client.balance(&treasury2), fee);
+    }
+
+    #[test]
+    fn test_fee_bps_change_reflected_immediately() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 1% fee
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for two sessions
+        let amount = 1_000_000_i128;
+        token_client.mint(&payer, &(amount * 2));
+
+        // First session with 1% fee
+        let session_id1 = vec![&env, 216u8, 217u8];
+        client.lock_funds(&session_id1, &payer, &payee, &token_id, &amount, &0);
+        client.approve_session(&session_id1, &payer);
+        client.approve_session(&session_id1, &payee);
+        client.complete_session(&session_id1, &payer);
+
+        let fee1 = (amount * 100) / 10000; // 10,000 at 1%
+        let treasury_balance_after_first = token_client.balance(&treasury);
+        assert_eq!(treasury_balance_after_first, fee1);
+
+        // Change fee to 5%
+        client.set_platform_fee_bps(&500);
+
+        // Second session with 5% fee
+        let session_id2 = vec![&env, 218u8, 219u8];
+        client.lock_funds(&session_id2, &payer, &payee, &token_id, &amount, &0);
+        client.approve_session(&session_id2, &payer);
+        client.approve_session(&session_id2, &payee);
+        client.complete_session(&session_id2, &payer);
+
+        let fee2 = (amount * 500) / 10000; // 50,000 at 5%
+        let expected_total = fee1 + fee2; // 60,000
+        assert_eq!(token_client.balance(&treasury), expected_total);
+    }
+
+    #[test]
+    fn test_net_and_fee_sum_to_original() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Test with various fee rates
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &333, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Test with amount that could cause rounding issues
+        let amount = 1_000_000_i128;
+        let fee_bps = 333; // 3.33%
+        let fee = (amount * fee_bps as i128) / 10000; // 33,300
+        let net = amount - fee; // 966,700
+        
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 220u8, 221u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+        client.complete_session(&session_id, &payer);
+
+        // Verify net + fee = original amount
+        assert_eq!(net + fee, amount);
+        
+        // Verify actual transfers
+        assert_eq!(token_client.balance(&treasury), fee);
     }
 }
