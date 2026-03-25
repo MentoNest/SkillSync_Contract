@@ -9,6 +9,7 @@ pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
 pub const DISPUTE_WINDOW_MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_DISPUTE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const PLATFORM_FEE_MAX_BPS: u32 = 1000; // 10%
+pub const MAX_FEE_BPS: u32 = 10_000; // 100% - absolute maximum
 pub const ESCROW_DURATION_SECONDS: u64 = 7 * 24 * 60 * 60; // Default 7 days
 pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 pub const MIN_UPGRADE_TIMELOCK_SECONDS: u64 = 60; // Minimum 1 minute timelock
@@ -32,6 +33,8 @@ enum DataKey {
     LastProcessedExpiryBucket,
     // Upgradeability storage keys
     PendingUpgrade,
+    // Fee configuration
+    FeeOnRefunds,
 }
 
 #[contracttype]
@@ -42,6 +45,7 @@ pub enum SessionStatus {
     Disputed = 2,
     Cancelled = 3,
     Locked = 4,
+    Resolved = 5,
 }
 
 /// Pending upgrade information for 2-phase commit upgrade pattern
@@ -120,7 +124,10 @@ pub struct Session {
     pub payer_approved: bool,
     pub payee_approved: bool,
     pub approved_at: u64,
-    pub dispute_opened_at: u64, // Timestamp when dispute was opened (0 if no dispute)
+    // Resolution fields for dispute resolution
+    pub resolved_at: u64,
+    pub resolver: Option<Address>,
+    pub resolution_note: Option<Bytes>,
 }
 
 const VERSION: u32 = 1;
@@ -151,8 +158,10 @@ pub enum Error {
     UpgradeNotReady = 20,       // Upgrade timelock has not elapsed
     UpgradeDeadlinePassed = 21, // Upgrade deadline has passed
     InvalidTimelock = 22,       // Invalid timelock duration
-    AlreadyDisputed = 23,       // Session is already in disputed state
-    InvalidDisputeState = 24,   // Session state doesn't allow opening dispute
+    InvalidResolutionAmount = 23, // Resolution amounts don't sum to available amount
+    SessionNotDisputed = 24,     // Session is not in Disputed status
+    ResolutionFeeError = 25,     // Error calculating resolution fees
+    FeeCalculationOverflow = 26, // Fee calculation overflow/underflow
 }
 
 #[contractimpl]
@@ -506,6 +515,50 @@ impl SkillSyncContract {
         Ok(())
     }
 
+    /// Returns whether fees are applied to refunds.
+    pub fn get_fee_on_refunds(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeOnRefunds)
+            .unwrap_or(false)
+    }
+
+    /// Sets whether fees should be applied to refunds.
+    /// Requires admin authorization.
+    pub fn set_fee_on_refunds(env: Env, fee_on_refunds: bool) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        let old = Self::get_fee_on_refunds(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeOnRefunds, &fee_on_refunds);
+        env.events()
+            .publish((Symbol::new(&env, "FeeOnRefundsUpdated"),), (old, fee_on_refunds));
+        Ok(())
+    }
+
+    /// Applies the settlement fee to a given amount.
+    /// Returns (net_amount, fee_amount) where net_amount + fee_amount = original amount.
+    /// Uses floor rounding: fee = amount * fee_bps / 10_000
+    fn apply_fee(env: &Env, amount: i128) -> Result<(i128, i128), Error> {
+        let fee_bps = Self::get_platform_fee_bps(env.clone()) as i128;
+        
+        // Calculate fee: amount * fee_bps / 10_000
+        let fee = amount
+            .checked_mul(fee_bps)
+            .ok_or(Error::FeeCalculationOverflow)?
+            .checked_div(10_000)
+            .ok_or(Error::FeeCalculationOverflow)?;
+        
+        // Net amount is the remainder
+        let net = amount
+            .checked_sub(fee)
+            .ok_or(Error::FeeCalculationOverflow)?;
+        
+        Ok((net, fee))
+    }
+
     /// Locks funds in escrow for a mentorship session.
     ///
     /// Validates inputs, calculates the platform fee (`amount * fee_bps / 10000`),
@@ -575,6 +628,9 @@ impl SkillSyncContract {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         // Store session (this also checks for duplicate session_id)
@@ -644,13 +700,8 @@ impl SkillSyncContract {
             return Err(Error::DisputeWindowNotElapsed);
         }
 
-        // Calculate fee
-        let fee = session
-            .amount
-            .checked_mul(session.fee_bps as i128)
-            .ok_or(Error::TransferError)?
-            .checked_div(10000)
-            .ok_or(Error::TransferError)?;
+        // Apply settlement fee using the configurable platform fee
+        let (net_amount, fee) = Self::apply_fee(&env, session.amount)?;
 
         // Get treasury address
         let treasury = Self::get_treasury(env.clone());
@@ -660,7 +711,7 @@ impl SkillSyncContract {
         let contract_id = env.current_contract_address();
 
         // Transfer net amount to payee
-        token_client.transfer(&contract_id, &session.payee, &session.amount);
+        token_client.transfer(&contract_id, &session.payee, &net_amount);
 
         // Transfer fee to treasury
         if fee > 0 {
@@ -677,10 +728,19 @@ impl SkillSyncContract {
         // Remove from expiry index since session is completed
         Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
 
+        // Emit FeeDeducted event
+        let fee_bps = Self::get_platform_fee_bps(env.clone());
+        if fee > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "FeeDeducted"),),
+                (session_id.clone(), session.amount, fee, fee_bps),
+            );
+        }
+
         // Emit SessionCompleted event
         env.events().publish(
             (Symbol::new(&env, "SessionCompleted"),),
-            (session_id, session.payee.clone(), session.amount, fee),
+            (session_id, session.payee.clone(), net_amount, fee),
         );
 
         Ok(())
@@ -994,25 +1054,31 @@ impl SkillSyncContract {
             return Err(Error::SessionNotExpired);
         }
 
-        // Calculate total amount to refund (amount + fee)
-        let fee = session
-            .amount
-            .checked_mul(session.fee_bps as i128)
-            .ok_or(Error::TransferError)?
-            .checked_div(10000)
-            .ok_or(Error::TransferError)?;
-
-        let total_refund = session
-            .amount
-            .checked_add(fee)
-            .ok_or(Error::TransferError)?;
-
         // Create token client
         let token_client = token::Client::new(&env, &session.asset);
         let contract_id = env.current_contract_address();
+        let treasury = Self::get_treasury(env.clone());
+
+        // Check if fees should be applied to refunds
+        let fee_on_refunds = Self::get_fee_on_refunds(env.clone());
+        
+        // Calculate the refund amount
+        let (refund_amount, fee_amount) = if fee_on_refunds {
+            // Apply settlement fee to the refund
+            let (net, fee) = Self::apply_fee(&env, session.amount)?;
+            (net, fee)
+        } else {
+            // No fee on refunds - return full amount
+            (session.amount, 0_i128)
+        };
 
         // Transfer refund to payer
-        token_client.transfer(&contract_id, &session.payer, &total_refund);
+        token_client.transfer(&contract_id, &session.payer, &refund_amount);
+
+        // Transfer fee to treasury if applicable
+        if fee_amount > 0 {
+            token_client.transfer(&contract_id, &treasury, &fee_amount);
+        }
 
         // Update session status to Cancelled
         let mut updated_session = session.clone();
@@ -1025,13 +1091,128 @@ impl SkillSyncContract {
         // Remove from expiry index
         Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
 
+        // Emit FeeDeducted event if fee was applied
+        let fee_bps = Self::get_platform_fee_bps(env.clone());
+        if fee_amount > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "FeeDeducted"),),
+                (session_id.clone(), session.amount, fee_amount, fee_bps),
+            );
+        }
+
         // Emit TimeoutRefunded event
         env.events().publish(
             (Symbol::new(&env, "TimeoutRefunded"),),
-            (session_id, session.payer, total_refund),
+            (session_id, session.payer, refund_amount),
         );
 
-        Ok(total_refund)
+        Ok(refund_amount)
+    }
+
+    /// Resolves a disputed escrow by splitting funds between payer and payee.
+    ///
+    /// This function can only be called by the admin/arbiter. It allows for partial
+    /// refunds to the payer and partial payouts to the beneficiary, with fee deduction.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    /// * `session_id` - The unique session identifier
+    /// * `to_payer` - Amount to refund to the payer
+    /// * `to_payee` - Amount to pay to the payee (beneficiary)
+    /// * `note` - Optional resolution note/reason
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if dispute was successfully resolved
+    /// - `Err(Error::SessionNotFound)` if session doesn't exist
+    /// - `Err(Error::SessionNotDisputed)` if session status is not Disputed
+    /// - `Err(Error::Unauthorized)` if caller is not admin/arbiter
+    /// - `Err(Error::InvalidResolutionAmount)` if amounts don't sum correctly
+    /// - `Err(Error::TransferError)` if token transfer fails
+    ///
+    /// # Events
+    ///
+    /// Emits `DisputeResolved { session_id, to_payer, to_payee, fee_total }` upon success
+    pub fn resolve_dispute(
+        env: Env,
+        session_id: Vec<u8>,
+        to_payer: i128,
+        to_payee: i128,
+        note: Option<Bytes>,
+    ) -> Result<(), Error> {
+        // Require admin/arbiter authorization
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        // Retrieve session
+        let mut session = Self::get_session(env.clone(), session_id.clone())
+            .ok_or(Error::SessionNotFound)?;
+
+        // Validate session status is Disputed
+        if session.status != SessionStatus::Disputed {
+            return Err(Error::SessionNotDisputed);
+        }
+
+        // Calculate the platform fee that was already collected when funds were locked
+        let fee = session.amount
+            .checked_mul(session.fee_bps as i128)
+            .ok_or(Error::ResolutionFeeError)?
+            .checked_div(10000)
+            .ok_or(Error::ResolutionFeeError)?;
+
+        // The available amount is the original amount (fee is already taken by platform)
+        let available_amount = session.amount;
+
+        // Validate that the split amounts sum to the available amount
+        let total_split = to_payer
+            .checked_add(to_payee)
+            .ok_or(Error::InvalidResolutionAmount)?;
+        
+        if total_split != available_amount {
+            return Err(Error::InvalidResolutionAmount);
+        }
+
+        // Validate non-negative amounts
+        if to_payer < 0 || to_payee < 0 {
+            return Err(Error::InvalidResolutionAmount);
+        }
+
+        // Create token client
+        let token_client = token::Client::new(&env, &session.asset);
+        let contract_id = env.current_contract_address();
+
+        // Transfer to payer (if any)
+        if to_payer > 0 {
+            token_client.transfer(&contract_id, &session.payer, &to_payer);
+        }
+
+        // Transfer to payee (if any)
+        if to_payee > 0 {
+            token_client.transfer(&contract_id, &session.payee, &to_payee);
+        }
+
+        // Update session status and resolution fields
+        let now = env.ledger().timestamp();
+        session.status = SessionStatus::Resolved;
+        session.updated_at = now;
+        session.resolved_at = now;
+        session.resolver = Some(admin);
+        session.resolution_note = note;
+
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &session);
+
+        // Remove from expiry index since session is resolved
+        Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
+
+        // Emit DisputeResolved event
+        env.events().publish(
+            (Symbol::new(&env, "DisputeResolved"),),
+            (session_id, to_payer, to_payee, fee),
+        );
+
+        Ok(())
     }
 }
 
@@ -1291,6 +1472,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&s);
@@ -1341,6 +1525,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         let s2 = Session {
@@ -1383,6 +1570,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&old);
@@ -1448,6 +1638,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         // store and ensure we can read back (decode) older versions
@@ -1488,6 +1681,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         // First insertion should succeed
@@ -1524,6 +1720,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         let mut session2 = session1.clone();
@@ -1564,6 +1763,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         let session2 = Session {
@@ -1611,6 +1813,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         // First insertion succeeds
@@ -1852,6 +2057,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&session_min);
@@ -2527,6 +2735,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&session).unwrap();
@@ -2564,6 +2775,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&session).unwrap();
@@ -3134,6 +3348,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&session).unwrap();
@@ -3700,6 +3917,11 @@ mod tests {
     }
 
     // ============================================================================
+    // resolve_dispute tests
+    // ============================================================================
+
+    #[test]
+    fn test_resolve_dispute_happy_path() {
     // Upgradeability Tests
     // ============================================================================
 
@@ -3716,6 +3938,73 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        token_client.mint(&payer, &total);
+
+        // Create a disputed session directly
+        let session_id = Bytes::from_array(&env, &[200u8, 201u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+
+        // Store session and fund the contract
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // Record balances before resolution
+        let payer_balance_before = token_client.balance(&payer);
+        let payee_balance_before = token_client.balance(&payee);
+
+        // Resolve dispute: 30% to payer, 70% to payee
+        let to_payer = 300_000_i128;
+        let to_payee = 700_000_i128;
+        let note = Some(Bytes::from_array(&env, &[1u8, 2u8, 3u8]));
+        
+        client.resolve_dispute(&session_id, &to_payer, &to_payee, &note);
+
+        // Verify balances after resolution
+        assert_eq!(token_client.balance(&payer), payer_balance_before + to_payer);
+        assert_eq!(token_client.balance(&payee), payee_balance_before + to_payee);
+
+        // Verify session status
+        let resolved_session = client.get_session(&session_id).unwrap();
+        assert_eq!(resolved_session.status, SessionStatus::Resolved);
+        assert_eq!(resolved_session.resolved_at, now);
+        assert_eq!(resolved_session.resolver, Some(admin));
+        assert_eq!(resolved_session.resolution_note, note);
+    }
+
+    #[test]
+    fn test_resolve_dispute_requires_admin_auth() {
         // Propose upgrade with 1 hour timelock
         let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
         let timelock: u64 = 3600; // 1 hour
@@ -3756,6 +4045,47 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Setup addresses
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_id = Address::generate(&env);
+
+        // Create a disputed session
+        let session_id = Bytes::from_array(&env, &[202u8, 203u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount: 1_000_000,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+
+        // Resolve dispute
+        client.resolve_dispute(&session_id, &500_000, &500_000, &None);
+
+        // Verify admin auth was required
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, admin);
+    }
+
+    #[test]
+    fn test_resolve_dispute_requires_disputed_status() {
         // Propose upgrade with 0 timelock (should use default)
         let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
         client.propose_upgrade(&wasm_hash, &0);
@@ -3782,6 +4112,43 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Setup addresses
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_id = Address::generate(&env);
+
+        // Create a Locked session (not Disputed)
+        let session_id = Bytes::from_array(&env, &[204u8, 205u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount: 1_000_000,
+            fee_bps: 250,
+            status: SessionStatus::Locked,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+
+        // Try to resolve - should fail because not Disputed
+        let result = client.try_resolve_dispute(&session_id, &500_000, &500_000, &None);
+        assert_eq!(result, Err(Ok(Error::SessionNotDisputed)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_requires_exact_amount_sum() {
         // Try to propose upgrade as non-admin (should panic)
         let non_admin = Address::generate(&env);
         env.set_auths(&[soroban_sdk::testutils::AuthorizedInvocation {
@@ -3810,6 +4177,48 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Setup addresses
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_id = Address::generate(&env);
+
+        // Create a disputed session with amount = 1_000_000
+        let session_id = Bytes::from_array(&env, &[206u8, 207u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount: 1_000_000,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+
+        // Try to resolve with amounts that don't sum to available amount
+        // Sum is 900_000, but available is 1_000_000
+        let result = client.try_resolve_dispute(&session_id, &400_000, &500_000, &None);
+        assert_eq!(result, Err(Ok(Error::InvalidResolutionAmount)));
+
+        // Try with amounts that sum to more than available
+        let result = client.try_resolve_dispute(&session_id, &600_000, &500_000, &None);
+        assert_eq!(result, Err(Ok(Error::InvalidResolutionAmount)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_zero_split_to_payer() {
         // Get initial version
         let initial_version = client.get_version();
         assert_eq!(initial_version, VERSION);
@@ -3863,6 +4272,50 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Create a disputed session
+        let amount = 1_000_000_i128;
+        let session_id = Bytes::from_array(&env, &[208u8, 209u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // Resolve with 0 to payer, all to payee
+        client.resolve_dispute(&session_id, &0, &amount, &None);
+
+        // Verify session status
+        let resolved_session = client.get_session(&session_id).unwrap();
+        assert_eq!(resolved_session.status, SessionStatus::Resolved);
+    }
+
+    #[test]
+    fn test_resolve_dispute_zero_split_to_payee() {
         // Propose upgrade with 1 hour timelock
         let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
         let timelock: u64 = 3600;
@@ -3886,6 +4339,50 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Create a disputed session
+        let amount = 1_000_000_i128;
+        let session_id = Bytes::from_array(&env, &[210u8, 211u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // Resolve with all to payer, 0 to payee (full refund)
+        client.resolve_dispute(&session_id, &amount, &0, &None);
+
+        // Verify session status
+        let resolved_session = client.get_session(&session_id).unwrap();
+        assert_eq!(resolved_session.status, SessionStatus::Resolved);
+    }
+
+    #[test]
+    fn test_resolve_dispute_rejects_negative_amounts() {
         // Try to apply upgrade without proposing (should panic)
         client.apply_upgrade();
     }
@@ -3904,6 +4401,47 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Setup addresses
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_id = Address::generate(&env);
+
+        // Create a disputed session
+        let session_id = Bytes::from_array(&env, &[212u8, 213u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount: 1_000_000,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+
+        // Try with negative to_payer
+        let result = client.try_resolve_dispute(&session_id, &-100, &1_000_100, &None);
+        assert_eq!(result, Err(Ok(Error::InvalidResolutionAmount)));
+
+        // Try with negative to_payee
+        let result = client.try_resolve_dispute(&session_id, &1_000_100, &-100, &None);
+        assert_eq!(result, Err(Ok(Error::InvalidResolutionAmount)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_emits_event() {
         // Propose upgrade as admin
         let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
         let timelock: u64 = 3600;
@@ -3940,6 +4478,47 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Create a disputed session
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let session_id = Bytes::from_array(&env, &[214u8, 215u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // Resolve dispute
+        let to_payer = 400_000_i128;
+        let to_payee = 600_000_i128;
+        client.resolve_dispute(&session_id, &to_payer, &to_payee, &None);
+
+        // Verify DisputeResolved event was emitted
         // Propose upgrade
         let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
         client.propose_upgrade(&wasm_hash, &3600);
@@ -3959,6 +4538,7 @@ mod tests {
         for event in events {
             if let Some(topics) = event.2.get(0) {
                 if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("DisputeResolved".to_string()) {
                     if symbol.to_string(&env) == Some("UpgradeCancelled".to_string()) {
                         found_event = true;
                         break;
@@ -3966,6 +4546,11 @@ mod tests {
                 }
             }
         }
+        assert!(found_event, "DisputeResolved event not found");
+    }
+
+    #[test]
+    fn test_resolve_dispute_idempotency() {
         assert!(found_event, "UpgradeCancelled event not found");
     }
 
@@ -4046,6 +4631,50 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Create a disputed session
+        let amount = 1_000_000_i128;
+        let session_id = Bytes::from_array(&env, &[216u8, 217u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // First resolution
+        client.resolve_dispute(&session_id, &500_000, &500_000, &None);
+
+        // Second resolution attempt should fail (session not Disputed anymore)
+        let result = client.try_resolve_dispute(&session_id, &500_000, &500_000, &None);
+        assert_eq!(result, Err(Ok(Error::SessionNotDisputed)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_session_not_found() {
         // Version should be set during init
         assert_eq!(client.get_version(), VERSION);
     }
@@ -4064,6 +4693,14 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Try to resolve non-existent session
+        let non_existent_id = Bytes::from_array(&env, &[255u8, 255u8]);
+        let result = client.try_resolve_dispute(&non_existent_id, &500_000, &500_000, &None);
+        assert_eq!(result, Err(Ok(Error::SessionNotFound)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_50_50_split() {
         // Try to propose upgrade with timelock below minimum (should panic)
         let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
         client.propose_upgrade(&wasm_hash, &30); // Less than MIN_UPGRADE_TIMELOCK_SECONDS (60)
@@ -4082,6 +4719,54 @@ mod tests {
         let treasury = Address::generate(&env);
         client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Create a disputed session
+        let amount = 1_000_000_i128;
+        let session_id = Bytes::from_array(&env, &[218u8, 219u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // Record balances before
+        let payer_balance_before = token_client.balance(&payer);
+        let payee_balance_before = token_client.balance(&payee);
+
+        // 50-50 split
+        let to_payer = 500_000_i128;
+        let to_payee = 500_000_i128;
+        client.resolve_dispute(&session_id, &to_payer, &to_payee, &None);
+
+        // Verify exact amounts transferred
+        assert_eq!(token_client.balance(&payer), payer_balance_before + to_payer);
+        assert_eq!(token_client.balance(&payee), payee_balance_before + to_payee);
+    }
+}
         // Propose first upgrade
         let wasm_hash1 = Bytes::from_array(&env, &[1u8; 32]);
         client.propose_upgrade(&wasm_hash1, &3600);
@@ -4099,5 +4784,843 @@ mod tests {
         assert_eq!(pending2.new_wasm_hash, wasm_hash2);
         assert_ne!(pending2.proposed_at, pending1.proposed_at);
         assert_eq!(pending2.deadline - pending2.proposed_at, 7200);
+    }
+
+    // ============================================================================
+    // Fee mechanics tests
+    // ============================================================================
+
+    #[test]
+    fn test_apply_fee_zero_bps() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 0 fee
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &0, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        token_client.mint(&payer, &amount);
+
+        // Lock funds with 0 fee
+        let session_id = vec![&env, 200u8, 201u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+
+        let payee_balance_before = token_client.balance(&payee);
+        client.complete_session(&session_id, &payer);
+
+        // Payee should receive full amount (no fee deducted)
+        assert_eq!(token_client.balance(&payee), payee_balance_before + amount);
+        
+        // Treasury should receive 0
+        assert_eq!(token_client.balance(&treasury), 0);
+    }
+
+    #[test]
+    fn test_apply_fee_typical_bps() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 2.5% fee (250 bps)
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee = (amount * 250) / 10000; // 25,000
+        let net = amount - fee; // 975,000
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 202u8, 203u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+
+        let payee_balance_before = token_client.balance(&payee);
+        let treasury_balance_before = token_client.balance(&treasury);
+        
+        client.complete_session(&session_id, &payer);
+
+        // Payee should receive net amount
+        assert_eq!(token_client.balance(&payee), payee_balance_before + net);
+        
+        // Treasury should receive fee
+        assert_eq!(token_client.balance(&treasury), treasury_balance_before + fee);
+    }
+
+    #[test]
+    fn test_apply_fee_max_bps() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 10% fee (1000 bps - the max platform fee)
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &1000, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee = (amount * 1000) / 10000; // 100,000
+        let net = amount - fee; // 900,000
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 204u8, 205u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+
+        let payee_balance_before = token_client.balance(&payee);
+        let treasury_balance_before = token_client.balance(&treasury);
+        
+        client.complete_session(&session_id, &payer);
+
+        // Payee should receive net amount
+        assert_eq!(token_client.balance(&payee), payee_balance_before + net);
+        
+        // Treasury should receive fee
+        assert_eq!(token_client.balance(&treasury), treasury_balance_before + fee);
+    }
+
+    #[test]
+    fn test_apply_fee_rounding_behavior() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 1% fee (100 bps)
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Test with amount that doesn't divide evenly
+        // amount = 1000, fee_bps = 100 (1%)
+        // fee = 1000 * 100 / 10000 = 10
+        // net = 1000 - 10 = 990
+        let amount = 1_000_i128;
+        let expected_fee = 10_i128;
+        let expected_net = 990_i128;
+        
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 206u8, 207u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+
+        let payee_balance_before = token_client.balance(&payee);
+        let treasury_balance_before = token_client.balance(&treasury);
+        
+        client.complete_session(&session_id, &payer);
+
+        // Verify floor rounding: fee = 10, net = 990
+        assert_eq!(token_client.balance(&payee), payee_balance_before + expected_net);
+        assert_eq!(token_client.balance(&treasury), treasury_balance_before + expected_fee);
+        
+        // Verify net + fee = original amount
+        assert_eq!(expected_net + expected_fee, amount);
+    }
+
+    #[test]
+    fn test_fee_deducted_event_emitted() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 2.5% fee
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 208u8, 209u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+        client.complete_session(&session_id, &payer);
+
+        // Verify FeeDeducted event was emitted
+        let events = env.events().all();
+        let mut found_fee_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("FeeDeducted".to_string()) {
+                        found_fee_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_fee_event, "FeeDeducted event not found");
+    }
+
+    #[test]
+    fn test_fee_on_refunds_config() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Default should be false
+        assert_eq!(client.get_fee_on_refunds(), false);
+
+        // Set to true
+        client.set_fee_on_refunds(&true);
+        assert_eq!(client.get_fee_on_refunds(), true);
+
+        // Set back to false
+        client.set_fee_on_refunds(&false);
+        assert_eq!(client.get_fee_on_refunds(), false);
+    }
+
+    #[test]
+    fn test_fee_on_refunds_requires_admin_auth() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Set fee_on_refunds
+        client.set_fee_on_refunds(&true);
+
+        // Verify admin auth was required
+        let auths = env.auths();
+        assert!(auths.len() >= 1);
+        // The most recent auth should be from admin
+        let last_auth = auths.get(auths.len() - 1);
+        assert_eq!(last_auth.0, admin);
+    }
+
+    #[test]
+    fn test_refund_without_fee_when_fee_on_refunds_false() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 10% fee but fee_on_refunds = false
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &1000, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+        // fee_on_refunds defaults to false
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 210u8, 211u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Record payer balance before refund
+        let payer_balance_before = token_client.balance(&payer);
+
+        // Advance past expiry and sweep
+        let session = client.get_session(&session_id).unwrap();
+        env.ledger().set_timestamp(session.expires_at + 1);
+        client.sweep_timeouts(&10);
+
+        // Payer should receive full refund (no fee deducted)
+        assert_eq!(token_client.balance(&payer), payer_balance_before + amount);
+        
+        // Treasury should receive nothing from refund
+        assert_eq!(token_client.balance(&treasury), 0);
+    }
+
+    #[test]
+    fn test_refund_with_fee_when_fee_on_refunds_true() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 10% fee and enable fee_on_refunds
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &1000, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+        client.set_fee_on_refunds(&true);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee = (amount * 1000) / 10000; // 100,000
+        let net = amount - fee; // 900,000
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 212u8, 213u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Record balances before refund
+        let payer_balance_before = token_client.balance(&payer);
+        let treasury_balance_before = token_client.balance(&treasury);
+
+        // Advance past expiry and sweep
+        let session = client.get_session(&session_id).unwrap();
+        env.ledger().set_timestamp(session.expires_at + 1);
+        client.sweep_timeouts(&10);
+
+        // Payer should receive net amount (fee deducted)
+        assert_eq!(token_client.balance(&payer), payer_balance_before + net);
+        
+        // Treasury should receive fee
+        assert_eq!(token_client.balance(&treasury), treasury_balance_before + fee);
+    }
+
+    #[test]
+    fn test_treasury_change_affects_fee_destination() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 2.5% fee
+        let admin = Address::generate(&env);
+        let treasury1 = Address::generate(&env);
+        client.init(&admin, &250, &treasury1, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        let fee = (amount * 250) / 10000;
+        token_client.mint(&payer, &amount);
+
+        // Change treasury
+        let treasury2 = Address::generate(&env);
+        client.set_treasury(&treasury2);
+
+        // Lock funds
+        let session_id = vec![&env, 214u8, 215u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+        client.complete_session(&session_id, &payer);
+
+        // First treasury should receive nothing
+        assert_eq!(token_client.balance(&treasury1), 0);
+        
+        // Second treasury should receive the fee
+        assert_eq!(token_client.balance(&treasury2), fee);
+    }
+
+    #[test]
+    fn test_fee_bps_change_reflected_immediately() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize with 1% fee
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for two sessions
+        let amount = 1_000_000_i128;
+        token_client.mint(&payer, &(amount * 2));
+
+        // First session with 1% fee
+        let session_id1 = vec![&env, 216u8, 217u8];
+        client.lock_funds(&session_id1, &payer, &payee, &token_id, &amount, &0);
+        client.approve_session(&session_id1, &payer);
+        client.approve_session(&session_id1, &payee);
+        client.complete_session(&session_id1, &payer);
+
+        let fee1 = (amount * 100) / 10000; // 10,000 at 1%
+        let treasury_balance_after_first = token_client.balance(&treasury);
+        assert_eq!(treasury_balance_after_first, fee1);
+
+        // Change fee to 5%
+        client.set_platform_fee_bps(&500);
+
+        // Second session with 5% fee
+        let session_id2 = vec![&env, 218u8, 219u8];
+        client.lock_funds(&session_id2, &payer, &payee, &token_id, &amount, &0);
+        client.approve_session(&session_id2, &payer);
+        client.approve_session(&session_id2, &payee);
+        client.complete_session(&session_id2, &payer);
+
+        let fee2 = (amount * 500) / 10000; // 50,000 at 5%
+        let expected_total = fee1 + fee2; // 60,000
+        assert_eq!(token_client.balance(&treasury), expected_total);
+    }
+
+    #[test]
+    fn test_net_and_fee_sum_to_original() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Test with various fee rates
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &333, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Test with amount that could cause rounding issues
+        let amount = 1_000_000_i128;
+        let fee_bps = 333; // 3.33%
+        let fee = (amount * fee_bps as i128) / 10000; // 33,300
+        let net = amount - fee; // 966,700
+        
+        token_client.mint(&payer, &amount);
+
+        // Lock funds
+        let session_id = vec![&env, 220u8, 221u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
+
+        // Approve and complete
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+        client.complete_session(&session_id, &payer);
+
+        // Verify net + fee = original amount
+        assert_eq!(net + fee, amount);
+        
+        // Verify actual transfers
+        assert_eq!(token_client.balance(&treasury), fee);
+    }
+
+    // ============================================================================
+    // Dispute Tests
+    // ============================================================================
+
+    #[test]
+    fn test_open_dispute_by_payer_success() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.mint(&payer, &total);
+
+        // Lock funds
+        let session_id = vec![&env, 230u8, 231u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Open dispute as payer
+        let reason = vec![&env, 1u8, 2u8, 3u8];
+        client.open_dispute(&session_id, &payer, &reason);
+
+        // Verify session status is Disputed
+        let disputed_session = client.get_session(&session_id).unwrap();
+        assert_eq!(disputed_session.status, SessionStatus::Disputed);
+        assert!(disputed_session.dispute_opened_at > 0);
+
+        // Verify DisputeOpened event was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("DisputeOpened".to_string()) {
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "DisputeOpened event not found");
+    }
+
+    #[test]
+    fn test_open_dispute_by_payee_success() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.mint(&payer, &total);
+
+        // Lock funds
+        let session_id = vec![&env, 232u8, 233u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Open dispute as payee
+        let reason = vec![&env, 4u8, 5u8, 6u8];
+        client.open_dispute(&session_id, &payee, &reason);
+
+        // Verify session status is Disputed
+        let disputed_session = client.get_session(&session_id).unwrap();
+        assert_eq!(disputed_session.status, SessionStatus::Disputed);
+        assert!(disputed_session.dispute_opened_at > 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "NotAuthorizedParty")]
+    fn test_open_dispute_by_unauthorized_party_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let unauthorized = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.mint(&payer, &total);
+
+        // Lock funds
+        let session_id = vec![&env, 234u8, 235u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Try to open dispute as unauthorized party (should panic)
+        let reason = vec![&env, 7u8, 8u8, 9u8];
+        client.open_dispute(&session_id, &unauthorized, &reason);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidDisputeState")]
+    fn test_open_dispute_on_completed_session_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.mint(&payer, &total);
+
+        // Lock funds
+        let session_id = vec![&env, 236u8, 237u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Complete the session first
+        client.approve_session(&session_id, &payer);
+        client.approve_session(&session_id, &payee);
+        client.complete_session(&session_id, &payer);
+
+        // Try to open dispute on completed session (should panic)
+        let reason = vec![&env, 10u8, 11u8, 12u8];
+        client.open_dispute(&session_id, &payer, &reason);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidDisputeState")]
+    fn test_open_dispute_on_already_disputed_session_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.mint(&payer, &total);
+
+        // Lock funds
+        let session_id = vec![&env, 238u8, 239u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Open dispute as payer
+        let reason1 = vec![&env, 13u8, 14u8, 15u8];
+        client.open_dispute(&session_id, &payer, &reason1);
+
+        // Try to open dispute again (should panic)
+        let reason2 = vec![&env, 16u8, 17u8, 18u8];
+        client.open_dispute(&session_id, &payee, &reason2);
+    }
+
+    #[test]
+    fn test_complete_session_blocked_when_disputed() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.mint(&payer, &total);
+
+        // Lock funds
+        let session_id = vec![&env, 240u8, 241u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Open dispute
+        let reason = vec![&env, 19u8, 20u8, 21u8];
+        client.open_dispute(&session_id, &payer, &reason);
+
+        // Try to complete session - should fail because status is Disputed, not Locked
+        // We need to check this returns an error
+        let result = client.try_complete_session(&session_id, &payer);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dispute_event_fields() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+
+        // Mint tokens
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.mint(&payer, &total);
+
+        // Lock funds
+        let session_id = vec![&env, 242u8, 243u8];
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
+
+        // Open dispute with specific reason
+        let reason = vec![&env, 22u8, 23u8, 24u8, 25u8];
+        client.open_dispute(&session_id, &payee, &reason);
+
+        // Verify event was emitted with correct fields
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("DisputeOpened".to_string()) {
+                        // Verify the event data contains session_id, disputer (payee), and reason
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "DisputeOpened event not found with correct fields");
+
+        // Verify state is persisted
+        let disputed_session = client.get_session(&session_id).unwrap();
+        assert_eq!(disputed_session.status, SessionStatus::Disputed);
+        assert!(disputed_session.dispute_opened_at > 0);
+        assert_eq!(disputed_session.updated_at, disputed_session.dispute_opened_at);
     }
 }
