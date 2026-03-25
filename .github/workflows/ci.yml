@@ -31,7 +31,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           ~/.cargo/bin
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock')-v2 }}
         restore-keys: |
           ${{ runner.os }}-cargo-
           
@@ -42,7 +42,7 @@ jobs:
           target/
           target/debug/.fingerprint/
           target/release/.fingerprint/
-        key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock')-v2 }}-${{ hashFiles('crates/contracts/core/src/**/*.rs') }}
         restore-keys: |
           ${{ runner.os }}-cargo-build-
           
@@ -62,10 +62,10 @@ jobs:
         # cargo test -p skillsync-core -p skillsync-tools
       
     - name: Build native
-      run: cargo build --release --locked
+      run: cargo build --release
       
     - name: Build WASM
-      run: cargo build -p core --target wasm32-unknown-unknown --release --locked
+      run: cargo build -p core --target wasm32-unknown-unknown --release
       
     - name: Verify WASM artifact exists
       run: |

@@ -44,7 +44,7 @@ jobs:
           cargo build -p core \
             --target wasm32-unknown-unknown \
             --release \
-            --locked
+            
         
       - name: Strip WASM binary
         run: |
@@ -107,8 +107,7 @@ jobs:
           export RUSTFLAGS="-C embed-bitcode=no"
           cargo build -p core \
             --target wasm32-unknown-unknown \
-            --release \
-            --locked
+            --release
           
           # Strip again
           wasm-tools strip \
