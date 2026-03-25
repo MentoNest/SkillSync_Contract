@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes, Env,
-    Symbol, Vec, Map, token,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
+    Env, Map, Symbol, Vec,
 };
 
 pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
@@ -11,6 +11,8 @@ pub const DEFAULT_DISPUTE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const PLATFORM_FEE_MAX_BPS: u32 = 1000; // 10%
 pub const ESCROW_DURATION_SECONDS: u64 = 7 * 24 * 60 * 60; // Default 7 days
 pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+pub const MIN_UPGRADE_TIMELOCK_SECONDS: u64 = 60; // Minimum 1 minute timelock
+pub const DEFAULT_UPGRADE_TIMELOCK_SECONDS: u64 = 24 * 60 * 60; // Default 1 day timelock
 
 #[contract]
 pub struct SkillSyncContract;
@@ -28,6 +30,8 @@ enum DataKey {
     ExpiryIndex(u64),
     // Track which day buckets have been processed for pagination
     LastProcessedExpiryBucket,
+    // Upgradeability storage keys
+    PendingUpgrade,
 }
 
 #[contracttype]
@@ -38,6 +42,21 @@ pub enum SessionStatus {
     Disputed = 2,
     Cancelled = 3,
     Locked = 4,
+}
+
+/// Pending upgrade information for 2-phase commit upgrade pattern
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    /// Hash of the new WASM code to upgrade to
+    pub new_wasm_hash: Bytes,
+    /// Timestamp when upgrade was proposed
+    pub proposed_at: u64,
+    /// Timestamp when upgrade can be applied (deadline)
+    /// If 0, no timelock is enforced
+    pub deadline: u64,
+    /// Block height at proposal time for additional safety
+    pub proposed_at_ledger: u32,
 }
 
 #[contracttype]
@@ -86,7 +105,6 @@ pub struct Session {
     // The contract enforces uniqueness via `put_session()`:
     // - Returns `DuplicateSessionId` error if session_id already exists
     // - This is a final guard; offchain systems should also validate uniqueness.
-
     pub version: u32,
     pub session_id: Bytes,
     pub payer: Address,
@@ -125,9 +143,13 @@ pub enum Error {
     NotAuthorizedParty = 13,
     AlreadyApproved = 14,
     InvalidSessionStatus = 15,
-    SessionNotExpired = 16,      // Session has not yet expired
-    RefundFailed = 17,           // Failed to refund escrow
-    NothingToSweep = 18,         // No expired sessions to sweep
+    SessionNotExpired = 16,     // Session has not yet expired
+    RefundFailed = 17,          // Failed to refund escrow
+    NothingToSweep = 18,        // No expired sessions to sweep
+    UpgradeNotProposed = 19,    // No upgrade has been proposed
+    UpgradeNotReady = 20,       // Upgrade timelock has not elapsed
+    UpgradeDeadlinePassed = 21, // Upgrade deadline has passed
+    InvalidTimelock = 22,       // Invalid timelock duration
 }
 
 #[contractimpl]
@@ -178,21 +200,28 @@ impl SkillSyncContract {
     /// Returns `Err(DuplicateSessionId)` if the session_id already exists.
     pub fn put_session(env: Env, session: Session) -> Result<(), Error> {
         let key = DataKey::Session(session.session_id.clone());
-        
+
         // Check if session_id already exists
         if env.storage().persistent().has(&key) {
             return Err(Error::DuplicateSessionId);
         }
-        
+
         env.storage().persistent().set(&key, &session);
         Ok(())
     }
 
     pub fn get_session(env: Env, session_id: Bytes) -> Option<Session> {
-        env.storage().persistent().get(&DataKey::Session(session_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::Session(session_id))
     }
 
-    pub fn update_session_status(env: Env, session_id: Bytes, new_status: SessionStatus, updated_at: u64) -> Result<(), Error> {
+    pub fn update_session_status(
+        env: Env,
+        session_id: Bytes,
+        new_status: SessionStatus,
+        updated_at: u64,
+    ) -> Result<(), Error> {
         let key = DataKey::Session(session_id.clone());
         match env.storage().persistent().get::<_, Session>(&key) {
             Some(mut s) => {
@@ -204,6 +233,201 @@ impl SkillSyncContract {
             None => Err(Error::SessionNotFound),
         }
     }
+
+    // ============================================================================
+    // Upgradeability Functions
+    // ============================================================================
+
+    /// Proposes a contract upgrade with optional timelock.
+    ///
+    /// This function implements the first phase of a 2-phase commit upgrade pattern.
+    /// Only the admin can propose upgrades. The timelock provides a safety window
+    /// during which the upgrade can be reviewed before application.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    /// * `new_wasm_hash` - The hash of the new WASM code to upgrade to
+    /// * `timelock_seconds` - Optional timelock duration in seconds. If 0, uses default.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if upgrade was successfully proposed
+    /// - `Err(Error::Unauthorized)` if caller is not admin
+    /// - `Err(Error::InvalidTimelock)` if timelock is too short
+    ///
+    /// # Events
+    ///
+    /// Emits `UpgradeProposed(new_wasm_hash, deadline, proposed_at)` upon success
+    pub fn propose_upgrade(
+        env: Env,
+        new_wasm_hash: Bytes,
+        timelock_seconds: u64,
+    ) -> Result<(), Error> {
+        // Require admin authorization
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        // Validate timelock (use default if 0)
+        let timelock = if timelock_seconds == 0 {
+            DEFAULT_UPGRADE_TIMELOCK_SECONDS
+        } else {
+            timelock_seconds
+        };
+
+        if timelock < MIN_UPGRADE_TIMELOCK_SECONDS {
+            return Err(Error::InvalidTimelock);
+        }
+
+        let now = env.ledger().timestamp();
+        let deadline = now + timelock;
+        let proposed_at_ledger = env.ledger().sequence();
+
+        // Store pending upgrade
+        let pending = PendingUpgrade {
+            new_wasm_hash: new_wasm_hash.clone(),
+            proposed_at: now,
+            deadline,
+            proposed_at_ledger,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &pending);
+
+        // Emit UpgradeProposed event
+        env.events().publish(
+            (Symbol::new(&env, "UpgradeProposed"),),
+            (new_wasm_hash, deadline, now, proposed_at_ledger),
+        );
+
+        Ok(())
+    }
+
+    /// Applies a previously proposed upgrade.
+    ///
+    /// This function implements the second phase of the 2-phase commit upgrade pattern.
+    /// Can only be called after the timelock has elapsed but before the deadline.
+    /// Only the admin can apply upgrades.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if upgrade was successfully applied
+    /// - `Err(Error::Unauthorized)` if caller is not admin
+    /// - `Err(Error::UpgradeNotProposed)` if no upgrade has been proposed
+    /// - `Err(Error::UpgradeNotReady)` if timelock has not elapsed
+    /// - `Err(Error::UpgradeDeadlinePassed)` if deadline has passed
+    ///
+    /// # Events
+    ///
+    /// Emits `Upgraded(old_version, new_version, wasm_hash)` upon success
+    pub fn apply_upgrade(env: Env) -> Result<(), Error> {
+        // Require admin authorization
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        // Get pending upgrade
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(Error::UpgradeNotProposed)?;
+
+        let now = env.ledger().timestamp();
+
+        // Check timelock has elapsed
+        if now < pending.deadline {
+            return Err(Error::UpgradeNotReady);
+        }
+
+        // Get current version and calculate new version
+        let old_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(VERSION);
+        let new_version = old_version + 1;
+
+        // Update version
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &new_version);
+
+        // Clear pending upgrade
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        // Emit Upgraded event
+        env.events().publish(
+            (Symbol::new(&env, "Upgraded"),),
+            (old_version, new_version, pending.new_wasm_hash, now),
+        );
+
+        Ok(())
+    }
+
+    /// Returns the current contract version.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(VERSION)
+    }
+
+    /// Returns the pending upgrade information if any.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&DataKey::PendingUpgrade)
+    }
+
+    /// Cancels a pending upgrade.
+    ///
+    /// Only the admin can cancel an upgrade.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if upgrade was successfully cancelled
+    /// - `Err(Error::Unauthorized)` if caller is not admin
+    /// - `Err(Error::UpgradeNotProposed)` if no upgrade has been proposed
+    ///
+    /// # Events
+    ///
+    /// Emits `UpgradeCancelled(wasm_hash, cancelled_at)` upon success
+    pub fn cancel_upgrade(env: Env) -> Result<(), Error> {
+        // Require admin authorization
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        // Get pending upgrade
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(Error::UpgradeNotProposed)?;
+
+        let now = env.ledger().timestamp();
+
+        // Clear pending upgrade
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        // Emit UpgradeCancelled event
+        env.events().publish(
+            (Symbol::new(&env, "UpgradeCancelled"),),
+            (pending.new_wasm_hash, now),
+        );
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // End Upgradeability Functions
+    // ============================================================================
 
     pub fn ping(_env: Env) -> u32 {
         1
@@ -320,9 +544,7 @@ impl SkillSyncContract {
             .checked_div(10000)
             .ok_or(Error::TransferError)?;
 
-        let total_amount = amount
-            .checked_add(fee)
-            .ok_or(Error::TransferError)?;
+        let total_amount = amount.checked_add(fee).ok_or(Error::TransferError)?;
 
         // Create token client for the asset
         let token_client = token::Client::new(&env, &asset);
@@ -398,17 +620,13 @@ impl SkillSyncContract {
     /// # Events
     ///
     /// Emits `SessionCompleted(session_id, payee, amount, fee)` upon success
-    pub fn complete_session(
-        env: Env,
-        session_id: Vec<u8>,
-        caller: Address,
-    ) -> Result<(), Error> {
+    pub fn complete_session(env: Env, session_id: Vec<u8>, caller: Address) -> Result<(), Error> {
         // Require caller authorization
         caller.require_auth();
 
         // Retrieve session
-        let mut session = Self::get_session(env.clone(), session_id.clone())
-            .ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         // Validate session status is Locked
         if session.status != SessionStatus::Locked {
@@ -418,13 +636,14 @@ impl SkillSyncContract {
         // Check dispute window has elapsed OR both parties approved
         let now = env.ledger().timestamp();
         let both_approved = session.payer_approved && session.payee_approved;
-        
+
         if !both_approved && now < session.dispute_deadline {
             return Err(Error::DisputeWindowNotElapsed);
         }
 
         // Calculate fee
-        let fee = session.amount
+        let fee = session
+            .amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::TransferError)?
             .checked_div(10000)
@@ -448,7 +667,7 @@ impl SkillSyncContract {
         // Update session status
         session.status = SessionStatus::Completed;
         session.updated_at = now;
-        
+
         let key = DataKey::Session(session_id.clone());
         env.storage().persistent().set(&key, &session);
 
@@ -494,17 +713,13 @@ impl SkillSyncContract {
     /// # Events
     ///
     /// Emits `SessionApproved(session_id, approver, both_approved)` upon success
-    pub fn approve_session(
-        env: Env,
-        session_id: Vec<u8>,
-        approver: Address,
-    ) -> Result<(), Error> {
+    pub fn approve_session(env: Env, session_id: Vec<u8>, approver: Address) -> Result<(), Error> {
         // Require approver authorization
         approver.require_auth();
 
         // Retrieve session
-        let mut session = Self::get_session(env.clone(), session_id.clone())
-            .ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         // Validate session status is Locked
         if session.status != SessionStatus::Locked {
@@ -566,7 +781,8 @@ impl SkillSyncContract {
         let key = DataKey::ExpiryIndex(day_bucket);
 
         // Get or create the list of session IDs for this bucket
-        let mut session_ids: Vec<Bytes> = env.storage()
+        let mut session_ids: Vec<Bytes> = env
+            .storage()
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
@@ -585,10 +801,7 @@ impl SkillSyncContract {
         let day_bucket = expires_at / SECONDS_PER_DAY;
         let key = DataKey::ExpiryIndex(day_bucket);
 
-        if let Some(mut session_ids) = env.storage()
-            .persistent()
-            .get::<_, Vec<Bytes>>(&key) 
-        {
+        if let Some(mut session_ids) = env.storage().persistent().get::<_, Vec<Bytes>>(&key) {
             // Create new vec without the session_id
             let mut new_ids = Vec::new(&env);
             for i in 0..session_ids.len() {
@@ -597,7 +810,7 @@ impl SkillSyncContract {
                     new_ids.push_back(id);
                 }
             }
-            
+
             if new_ids.is_empty() {
                 env.storage().persistent().remove(&key);
             } else {
@@ -609,23 +822,24 @@ impl SkillSyncContract {
     }
 
     /// Sweeps expired escrows and refunds funds to payers.
-    /// 
+    ///
     /// This function:
     /// 1. Gets the current ledger timestamp
     /// 2. Iterates over expiry day buckets up to the current day
     /// 3. For each expired session, calls internal_refund
     /// 4. Returns the number of sessions processed
-    /// 
+    ///
     /// The `batch` parameter limits how many sessions to process in one call
     /// to stay within budget limits.
-    /// 
+    ///
     /// Anyone can call this function - it's permissionless for automation.
     pub fn sweep_timeouts(env: Env, batch: u32) -> Result<u32, Error> {
         let now = env.ledger().timestamp();
         let current_day_bucket = now / SECONDS_PER_DAY;
-        
+
         // Get the last processed bucket (start from 0 if not set)
-        let last_processed = env.storage()
+        let last_processed = env
+            .storage()
             .instance()
             .get::<_, u64>(&DataKey::LastProcessedExpiryBucket)
             .unwrap_or(0);
@@ -636,11 +850,8 @@ impl SkillSyncContract {
         // Iterate through day buckets up to current day, respecting batch limit
         while current_bucket < current_day_bucket && processed < batch {
             let key = DataKey::ExpiryIndex(current_bucket);
-            
-            if let Some(session_ids) = env.storage()
-                .persistent()
-                .get::<_, Vec<Bytes>>(&key) 
-            {
+
+            if let Some(session_ids) = env.storage().persistent().get::<_, Vec<Bytes>>(&key) {
                 // Process each session in this bucket
                 for i in 0..session_ids.len() {
                     if processed >= batch {
@@ -648,7 +859,7 @@ impl SkillSyncContract {
                     }
 
                     let session_id = session_ids.get(i).unwrap();
-                    
+
                     // Try to refund this session if it exists and is expired
                     if let Some(session) = Self::get_session(env.clone(), session_id.clone()) {
                         // Check if session is actually expired (status is Locked and past expires_at)
@@ -661,8 +872,9 @@ impl SkillSyncContract {
                                 Err(e) => {
                                     // Log error but continue with next session
                                     // This ensures partial success even if one fails
-                                    if e != Error::SessionNotFound && 
-                                       e != Error::InvalidSessionStatus {
+                                    if e != Error::SessionNotFound
+                                        && e != Error::InvalidSessionStatus
+                                    {
                                         return Err(e);
                                     }
                                 }
@@ -694,14 +906,14 @@ impl SkillSyncContract {
 
     /// Internal function to refund an expired escrow.
     /// Transfers funds back to the payer.
-    /// 
+    ///
     /// This function is idempotent - calling it multiple times on the same
     /// session will not cause issues (the session will be marked as Cancelled
     /// after first successful refund).
     fn internal_refund(env: Env, session_id: Bytes) -> Result<i128, Error> {
         // Retrieve session
-        let session = Self::get_session(env.clone(), session_id.clone())
-            .ok_or(Error::SessionNotFound)?;
+        let session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         // Only refund Locked sessions that have expired
         if session.status != SessionStatus::Locked {
@@ -714,13 +926,15 @@ impl SkillSyncContract {
         }
 
         // Calculate total amount to refund (amount + fee)
-        let fee = session.amount
+        let fee = session
+            .amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::TransferError)?
             .checked_div(10000)
             .ok_or(Error::TransferError)?;
 
-        let total_refund = session.amount
+        let total_refund = session
+            .amount
             .checked_add(fee)
             .ok_or(Error::TransferError)?;
 
@@ -778,7 +992,7 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger as _},
-        vec, Address, Bytes, Env, IntoVal, Symbol, token,
+        token, vec, Address, Bytes, Env, IntoVal, Symbol,
     };
 
     #[test]
@@ -879,7 +1093,14 @@ mod tests {
                 (
                     contract_id.clone(),
                     (Symbol::new(&env, "Initialized"),).into_val(&env),
-                    (admin, 100_u32, treasury, DEFAULT_DISPUTE_WINDOW_SECONDS, VERSION).into_val(&env)
+                    (
+                        admin,
+                        100_u32,
+                        treasury,
+                        DEFAULT_DISPUTE_WINDOW_SECONDS,
+                        VERSION
+                    )
+                        .into_val(&env)
                 ),
                 (
                     contract_id.clone(),
@@ -951,7 +1172,14 @@ mod tests {
                 (
                     contract_id.clone(),
                     (Symbol::new(&env, "Initialized"),).into_val(&env),
-                    (admin, 100_u32, treasury.clone(), DEFAULT_DISPUTE_WINDOW_SECONDS, VERSION).into_val(&env)
+                    (
+                        admin,
+                        100_u32,
+                        treasury.clone(),
+                        DEFAULT_DISPUTE_WINDOW_SECONDS,
+                        VERSION
+                    )
+                        .into_val(&env)
                 ),
                 (
                     contract_id.clone(),
@@ -1046,7 +1274,10 @@ mod tests {
             approved_at: 0,
         };
 
-        let s2 = Session { session_id: sid2.clone(), ..s1.clone() };
+        let s2 = Session {
+            session_id: sid2.clone(),
+            ..s1.clone()
+        };
 
         client.put_session(&s1);
         client.put_session(&s2);
@@ -1266,8 +1497,14 @@ mod tests {
             approved_at: 0,
         };
 
-        let session2 = Session { session_id: sid2.clone(), ..session1.clone() };
-        let session3 = Session { session_id: sid3.clone(), ..session1.clone() };
+        let session2 = Session {
+            session_id: sid2.clone(),
+            ..session1.clone()
+        };
+        let session3 = Session {
+            session_id: sid3.clone(),
+            ..session1.clone()
+        };
 
         // All different session_ids should be accepted
         client.put_session(&session1);
@@ -1428,8 +1665,11 @@ mod tests {
             };
 
             let result = client.try_put_session(&session);
-            assert_eq!(result, Err(Ok(Error::DuplicateSessionId)),
-                "Expected DuplicateSessionId error for existing ID");
+            assert_eq!(
+                result,
+                Err(Ok(Error::DuplicateSessionId)),
+                "Expected DuplicateSessionId error for existing ID"
+            );
         }
     }
 
@@ -1443,12 +1683,27 @@ mod tests {
 
         // Simulate large ID patterns (like SHA256 hashes or UUIDs)
         let large_ids = [
-            Bytes::from_array(&env, &[0x4du8, 0x6fu8, 0x9eu8, 0x8bu8, 0xcdu8, 0xf4u8, 0x2bu8, 0xa0u8,
-                 0x45u8, 0xcfu8, 0x15u8, 0x11u8, 0x6au8, 0x7bu8, 0xd8u8, 0xe9u8]),
-            Bytes::from_array(&env, &[0xffu8, 0xeeu8, 0xddu8, 0xccu8, 0xbbu8, 0xaau8, 0x99u8, 0x88u8,
-                 0x77u8, 0x66u8, 0x55u8, 0x44u8, 0x33u8, 0x22u8, 0x11u8, 0x00u8]),
-            Bytes::from_array(&env, &[0x00u8, 0x11u8, 0x22u8, 0x33u8, 0x44u8, 0x55u8, 0x66u8, 0x77u8,
-                 0x88u8, 0x99u8, 0xaau8, 0xbbu8, 0xccu8, 0xddu8, 0xeeu8, 0xffu8]),
+            Bytes::from_array(
+                &env,
+                &[
+                    0x4du8, 0x6fu8, 0x9eu8, 0x8bu8, 0xcdu8, 0xf4u8, 0x2bu8, 0xa0u8, 0x45u8, 0xcfu8,
+                    0x15u8, 0x11u8, 0x6au8, 0x7bu8, 0xd8u8, 0xe9u8,
+                ],
+            ),
+            Bytes::from_array(
+                &env,
+                &[
+                    0xffu8, 0xeeu8, 0xddu8, 0xccu8, 0xbbu8, 0xaau8, 0x99u8, 0x88u8, 0x77u8, 0x66u8,
+                    0x55u8, 0x44u8, 0x33u8, 0x22u8, 0x11u8, 0x00u8,
+                ],
+            ),
+            Bytes::from_array(
+                &env,
+                &[
+                    0x00u8, 0x11u8, 0x22u8, 0x33u8, 0x44u8, 0x55u8, 0x66u8, 0x77u8, 0x88u8, 0x99u8,
+                    0xaau8, 0xbbu8, 0xccu8, 0xddu8, 0xeeu8, 0xffu8,
+                ],
+            ),
         ];
 
         for (idx, sid) in large_ids.iter().enumerate() {
@@ -1562,14 +1817,7 @@ mod tests {
         let amount = 1_000_000_i128;
         let fee_bps = 250u32; // 2.5%
 
-        client.lock_funds(
-            &session_id,
-            &payer,
-            &payee,
-            &token_id,
-            &amount,
-            &fee_bps,
-        );
+        client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
 
         // Verify session was created and stored
         let stored_session = client.get_session(&session_id);
@@ -1659,14 +1907,8 @@ mod tests {
         client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
 
         // Second lock with same session_id should fail
-        let result2 = client.try_lock_funds(
-            &session_id,
-            &payer,
-            &payee2,
-            &token_id,
-            &amount,
-            &fee_bps,
-        );
+        let result2 =
+            client.try_lock_funds(&session_id, &payer, &payee2, &token_id, &amount, &fee_bps);
         assert!(result2.is_err());
         assert_eq!(result2.unwrap_err(), Ok(Error::DuplicateSessionId));
     }
@@ -1715,14 +1957,8 @@ mod tests {
         token_admin.mint(&payer, &(total_needed * 9 / 10));
 
         let session_id = Bytes::from_array(&env, &[15u8, 16u8]);
-        let result = client.try_lock_funds(
-            &session_id,
-            &payer,
-            &payee,
-            &token_id,
-            &amount,
-            &fee_bps,
-        );
+        let result =
+            client.try_lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), Ok(Error::InsufficientBalance));
@@ -1743,10 +1979,10 @@ mod tests {
 
         // Test various fee scenarios
         let test_cases: [(i128, u32, i128); 6] = [
-            (1_000_000i128, 0u32, 0i128),        // 0% fee
-            (1_000_000i128, 100u32, 10_000i128), // 1% fee = 10,000
-            (1_000_000i128, 250u32, 25_000i128), // 2.5% fee = 25,000
-            (1_000_000i128, 500u32, 50_000i128), // 5% fee = 50,000
+            (1_000_000i128, 0u32, 0i128),          // 0% fee
+            (1_000_000i128, 100u32, 10_000i128),   // 1% fee = 10,000
+            (1_000_000i128, 250u32, 25_000i128),   // 2.5% fee = 25,000
+            (1_000_000i128, 500u32, 50_000i128),   // 5% fee = 50,000
             (1_000_000i128, 1000u32, 100_000i128), // 10% fee = 100,000
             (10_000_000i128, 500u32, 500_000i128), // 5% of 10M = 500,000
         ];
@@ -1825,7 +2061,14 @@ mod tests {
                 (
                     contract_id.clone(),
                     (Symbol::new(&env, "FundsLocked"),).into_val(&env),
-                    (session_id.clone(), payer.clone(), payee.clone(), amount, expected_fee).into_val(&env)
+                    (
+                        session_id.clone(),
+                        payer.clone(),
+                        payee.clone(),
+                        amount,
+                        expected_fee
+                    )
+                        .into_val(&env)
                 )
             ]
         );
@@ -1847,7 +2090,11 @@ mod tests {
         token_admin.mint(&base_payer, &(100_000_000_i128));
 
         for i in 0..5 {
-            let payer = if i == 0 { base_payer.clone() } else { Address::generate(&env) };
+            let payer = if i == 0 {
+                base_payer.clone()
+            } else {
+                Address::generate(&env)
+            };
             if i > 0 {
                 token_admin.mint(&payer, &(10_000_000_i128));
             }
@@ -1953,7 +2200,9 @@ mod tests {
 
         client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
-        assert!(client.try_set_platform_fee_bps(&PLATFORM_FEE_MAX_BPS).is_ok());
+        assert!(client
+            .try_set_platform_fee_bps(&PLATFORM_FEE_MAX_BPS)
+            .is_ok());
         assert_eq!(client.get_platform_fee_bps(), PLATFORM_FEE_MAX_BPS);
     }
 
@@ -2031,7 +2280,13 @@ mod tests {
                 (
                     contract_id.clone(),
                     (Symbol::new(&env, "Initialized"),).into_val(&env),
-                    (admin, old_fee, treasury, DEFAULT_DISPUTE_WINDOW_SECONDS, VERSION)
+                    (
+                        admin,
+                        old_fee,
+                        treasury,
+                        DEFAULT_DISPUTE_WINDOW_SECONDS,
+                        VERSION
+                    )
                         .into_val(&env)
                 ),
                 (
@@ -2076,7 +2331,14 @@ mod tests {
                 (
                     contract_id.clone(),
                     (Symbol::new(&env, "Initialized"),).into_val(&env),
-                    (admin.clone(), 0_u32, treasury.clone(), DEFAULT_DISPUTE_WINDOW_SECONDS, VERSION).into_val(&env)
+                    (
+                        admin.clone(),
+                        0_u32,
+                        treasury.clone(),
+                        DEFAULT_DISPUTE_WINDOW_SECONDS,
+                        VERSION
+                    )
+                        .into_val(&env)
                 ),
                 (
                     contract_id.clone(),
@@ -2132,7 +2394,8 @@ mod tests {
 
         // Fast forward past dispute window
         let current_time = env.ledger().timestamp();
-        env.ledger().set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
+        env.ledger()
+            .set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
 
         // Complete session
         let result = client.complete_session(&session_id, &payer);
@@ -2309,7 +2572,8 @@ mod tests {
 
         // Set time exactly at deadline (should still fail, needs to be after)
         let current_time = env.ledger().timestamp();
-        env.ledger().set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS);
+        env.ledger()
+            .set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS);
 
         let result = client.try_complete_session(&session_id, &payer);
         assert!(result.is_err());
@@ -2347,7 +2611,8 @@ mod tests {
 
         // Fast forward past dispute window
         let current_time = env.ledger().timestamp();
-        env.ledger().set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
+        env.ledger()
+            .set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
 
         // Complete session
         let result = client.complete_session(&session_id, &payer);
@@ -2440,7 +2705,8 @@ mod tests {
 
         // Fast forward past dispute window
         let current_time = env.ledger().timestamp();
-        env.ledger().set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
+        env.ledger()
+            .set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
 
         // Complete session
         client.complete_session(&session_id, &payer);
@@ -2494,7 +2760,8 @@ mod tests {
 
             // Fast forward
             let current_time = env.ledger().timestamp();
-            env.ledger().set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
+            env.ledger()
+                .set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
 
             // Complete
             let result = client.complete_session(&session_id, &payer);
@@ -2540,7 +2807,8 @@ mod tests {
 
         // Fast forward past dispute window
         let current_time = env.ledger().timestamp();
-        env.ledger().set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
+        env.ledger()
+            .set_timestamp(current_time + DEFAULT_DISPUTE_WINDOW_SECONDS + 1);
 
         // Complete session with different caller
         client.complete_session(&session_id, &caller);
@@ -3100,11 +3368,11 @@ mod tests {
         let payer2 = Address::generate(&env);
         let payee1 = Address::generate(&env);
         let payee2 = Address::generate(&env);
-        
+
         let token_contract1 = env.register_stellar_asset_contract(payer1.clone());
         let token_id1 = Address::from_contract_id(&env, &token_contract1);
         let token_client1 = token::Client::new(&env, &token_id1);
-        
+
         let token_contract2 = env.register_stellar_asset_contract(payer2.clone());
         let token_id2 = Address::from_contract_id(&env, &token_contract2);
         let token_client2 = token::Client::new(&env, &token_id2);
@@ -3114,16 +3382,30 @@ mod tests {
         let fee_bps = 250u32;
         let fee = (amount * fee_bps as i128) / 10000;
         let total = amount + fee;
-        
+
         token_client1.mint(&payer1, &total);
         token_client2.mint(&payer2, &total);
 
         // Lock funds for multiple sessions
         let session_id1 = vec![&env, 104u8, 105u8];
         let session_id2 = vec![&env, 106u8, 107u8];
-        
-        client.lock_funds(&session_id1, &payer1, &payee1, &token_id1, &amount, &fee_bps);
-        client.lock_funds(&session_id2, &payer2, &payee2, &token_id2, &amount, &fee_bps);
+
+        client.lock_funds(
+            &session_id1,
+            &payer1,
+            &payee1,
+            &token_id1,
+            &amount,
+            &fee_bps,
+        );
+        client.lock_funds(
+            &session_id2,
+            &payer2,
+            &payee2,
+            &token_id2,
+            &amount,
+            &fee_bps,
+        );
 
         // Get expiry times and advance past them
         let session1 = client.get_session(&session_id1).unwrap();
@@ -3165,9 +3447,9 @@ mod tests {
         let fee_bps = 250u32;
         let fee = (amount * fee_bps as i128) / 10000;
         let session_total = amount + fee;
-        
+
         let mut session_ids: Vec<Vec<u8>> = Vec::new(&env);
-        
+
         // Create 5 sessions
         for i in 0..5u32 {
             let payer = Address::generate(&env);
@@ -3175,9 +3457,9 @@ mod tests {
             let token_contract = env.register_stellar_asset_contract(payer.clone());
             let token_id = Address::from_contract_id(&env, &token_contract);
             let token_client = token::Client::new(&env, &token_id);
-            
+
             token_client.mint(&payer, &session_total);
-            
+
             let session_id = vec![&env, (110 + i) as u8, (111 + i) as u8];
             client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &fee_bps);
             session_ids.push_back(session_id);
@@ -3346,5 +3628,407 @@ mod tests {
             }
         }
         assert!(found_event, "TimeoutRefunded event not found");
+    }
+
+    // ============================================================================
+    // Upgradeability Tests
+    // ============================================================================
+
+    #[test]
+    fn test_propose_upgrade_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade with 1 hour timelock
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        let timelock: u64 = 3600; // 1 hour
+        client.propose_upgrade(&wasm_hash, &timelock);
+
+        // Verify pending upgrade exists
+        let pending = client.get_pending_upgrade().unwrap();
+        assert_eq!(pending.new_wasm_hash, wasm_hash);
+        assert!(pending.deadline > pending.proposed_at);
+        assert_eq!(pending.deadline - pending.proposed_at, timelock);
+
+        // Verify UpgradeProposed event was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("UpgradeProposed".to_string()) {
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "UpgradeProposed event not found");
+    }
+
+    #[test]
+    fn test_propose_upgrade_default_timelock() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade with 0 timelock (should use default)
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&wasm_hash, &0);
+
+        // Verify pending upgrade uses default timelock
+        let pending = client.get_pending_upgrade().unwrap();
+        assert_eq!(
+            pending.deadline - pending.proposed_at,
+            DEFAULT_UPGRADE_TIMELOCK_SECONDS
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_propose_upgrade_by_non_admin_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Try to propose upgrade as non-admin (should panic)
+        let non_admin = Address::generate(&env);
+        env.set_auths(&[soroban_sdk::testutils::AuthorizedInvocation {
+            function: soroban_sdk::testutils::AuthorizedFunction::Contract((
+                contract_id.clone(),
+                Symbol::new(&env, "propose_upgrade"),
+                (Bytes::from_array(&env, &[1u8; 32]), 3600u64).into_val(&env),
+            )),
+            sub_invocations: Vec::new(&env),
+        }]);
+
+        // This should panic with Unauthorized
+        client.propose_upgrade(&Bytes::from_array(&env, &[1u8; 32]), &3600);
+    }
+
+    #[test]
+    fn test_apply_upgrade_success() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Get initial version
+        let initial_version = client.get_version();
+        assert_eq!(initial_version, VERSION);
+
+        // Propose upgrade with 1 hour timelock
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        let timelock: u64 = 3600;
+        client.propose_upgrade(&wasm_hash, &timelock);
+
+        // Advance time past the deadline
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + timelock + 1);
+
+        // Apply upgrade
+        client.apply_upgrade();
+
+        // Verify version incremented
+        let new_version = client.get_version();
+        assert_eq!(new_version, initial_version + 1);
+
+        // Verify pending upgrade cleared
+        assert!(client.get_pending_upgrade().is_none());
+
+        // Verify Upgraded event was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("Upgraded".to_string()) {
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "Upgraded event not found");
+    }
+
+    #[test]
+    #[should_panic(expected = "UpgradeNotReady")]
+    fn test_apply_upgrade_before_deadline_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade with 1 hour timelock
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        let timelock: u64 = 3600;
+        client.propose_upgrade(&wasm_hash, &timelock);
+
+        // Try to apply upgrade before deadline (should panic)
+        client.apply_upgrade();
+    }
+
+    #[test]
+    #[should_panic(expected = "UpgradeNotProposed")]
+    fn test_apply_upgrade_without_proposal_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Try to apply upgrade without proposing (should panic)
+        client.apply_upgrade();
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_apply_upgrade_by_non_admin_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade as admin
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        let timelock: u64 = 3600;
+        client.propose_upgrade(&wasm_hash, &timelock);
+
+        // Advance time past the deadline
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + timelock + 1);
+
+        // Try to apply upgrade as non-admin (should panic)
+        let non_admin = Address::generate(&env);
+        env.set_auths(&[soroban_sdk::testutils::AuthorizedInvocation {
+            function: soroban_sdk::testutils::AuthorizedFunction::Contract((
+                contract_id.clone(),
+                Symbol::new(&env, "apply_upgrade"),
+                ().into_val(&env),
+            )),
+            sub_invocations: Vec::new(&env),
+        }]);
+
+        client.apply_upgrade();
+    }
+
+    #[test]
+    fn test_cancel_upgrade_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&wasm_hash, &3600);
+
+        // Verify pending upgrade exists
+        assert!(client.get_pending_upgrade().is_some());
+
+        // Cancel upgrade
+        client.cancel_upgrade();
+
+        // Verify pending upgrade cleared
+        assert!(client.get_pending_upgrade().is_none());
+
+        // Verify UpgradeCancelled event was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("UpgradeCancelled".to_string()) {
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "UpgradeCancelled event not found");
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_cancel_upgrade_by_non_admin_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&wasm_hash, &3600);
+
+        // Try to cancel upgrade as non-admin (should panic)
+        env.set_auths(&[soroban_sdk::testutils::AuthorizedInvocation {
+            function: soroban_sdk::testutils::AuthorizedFunction::Contract((
+                contract_id.clone(),
+                Symbol::new(&env, "cancel_upgrade"),
+                ().into_val(&env),
+            )),
+            sub_invocations: Vec::new(&env),
+        }]);
+
+        client.cancel_upgrade();
+    }
+
+    #[test]
+    fn test_version_increments_on_multiple_upgrades() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        let initial_version = client.get_version();
+
+        // Perform multiple upgrades
+        for i in 0..3 {
+            let wasm_hash = Bytes::from_array(&env, &[(i + 1) as u8; 32]);
+            let timelock: u64 = 60; // Short timelock for testing
+
+            client.propose_upgrade(&wasm_hash, &timelock);
+
+            // Advance time past deadline
+            let current_time = env.ledger().timestamp();
+            env.ledger().set_timestamp(current_time + timelock + 1);
+
+            client.apply_upgrade();
+        }
+
+        // Verify version incremented 3 times
+        assert_eq!(client.get_version(), initial_version + 3);
+    }
+
+    #[test]
+    fn test_get_version_returns_default_when_not_set() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Version should be set during init
+        assert_eq!(client.get_version(), VERSION);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidTimelock")]
+    fn test_propose_upgrade_with_invalid_timelock_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Try to propose upgrade with timelock below minimum (should panic)
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&wasm_hash, &30); // Less than MIN_UPGRADE_TIMELOCK_SECONDS (60)
+    }
+
+    #[test]
+    fn test_propose_upgrade_overwrites_existing() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose first upgrade
+        let wasm_hash1 = Bytes::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&wasm_hash1, &3600);
+
+        let pending1 = client.get_pending_upgrade().unwrap();
+
+        // Propose second upgrade (should overwrite)
+        let wasm_hash2 = Bytes::from_array(&env, &[2u8; 32]);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 100);
+        client.propose_upgrade(&wasm_hash2, &7200);
+
+        let pending2 = client.get_pending_upgrade().unwrap();
+
+        // Verify second upgrade replaced first
+        assert_eq!(pending2.new_wasm_hash, wasm_hash2);
+        assert_ne!(pending2.proposed_at, pending1.proposed_at);
+        assert_eq!(pending2.deadline - pending2.proposed_at, 7200);
     }
 }
