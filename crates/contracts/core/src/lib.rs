@@ -120,6 +120,7 @@ pub struct Session {
     pub payer_approved: bool,
     pub payee_approved: bool,
     pub approved_at: u64,
+    pub dispute_opened_at: u64, // Timestamp when dispute was opened (0 if no dispute)
 }
 
 const VERSION: u32 = 1;
@@ -150,6 +151,8 @@ pub enum Error {
     UpgradeNotReady = 20,       // Upgrade timelock has not elapsed
     UpgradeDeadlinePassed = 21, // Upgrade deadline has passed
     InvalidTimelock = 22,       // Invalid timelock duration
+    AlreadyDisputed = 23,       // Session is already in disputed state
+    InvalidDisputeState = 24,   // Session state doesn't allow opening dispute
 }
 
 #[contractimpl]
@@ -768,6 +771,72 @@ impl SkillSyncContract {
         env.events().publish(
             (Symbol::new(&env, "SessionApproved"),),
             (session_id, approver, both_approved),
+        );
+
+        Ok(())
+    }
+
+    /// Opens a dispute on an active escrow session.
+    ///
+    /// This function allows either the payer or payee to open a dispute on a session
+    /// that is in Locked status. Once disputed, the session status changes to Disputed
+    /// and settlement actions are frozen until an arbiter/admin resolves the dispute.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    /// * `session_id` - The unique session identifier
+    /// * `disputer` - The address of the party opening the dispute (must be payer or payee)
+    /// * `reason` - The reason for opening the dispute
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if dispute was successfully opened
+    /// - `Err(Error::SessionNotFound)` if session doesn't exist
+    /// - `Err(Error::NotAuthorizedParty)` if disputer is neither payer nor payee
+    /// - `Err(Error::InvalidSessionStatus)` if session is not in Locked status
+    /// - `Err(Error::AlreadyDisputed)` if session is already disputed
+    ///
+    /// # Events
+    ///
+    /// Emits `DisputeOpened(session_id, disputer, reason)` upon success
+    pub fn open_dispute(
+        env: Env,
+        session_id: Vec<u8>,
+        disputer: Address,
+        reason: Vec<u8>,
+    ) -> Result<(), Error> {
+        // Require disputer authorization
+        disputer.require_auth();
+
+        // Retrieve session
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+
+        // Validate disputer is either payer or payee
+        if disputer != session.payer && disputer != session.payee {
+            return Err(Error::NotAuthorizedParty);
+        }
+
+        // Validate session status is Locked (only Locked sessions can be disputed)
+        if session.status != SessionStatus::Locked {
+            return Err(Error::InvalidDisputeState);
+        }
+
+        // Update session status to Disputed
+        let now = env.ledger().timestamp();
+        session.status = SessionStatus::Disputed;
+        session.dispute_opened_at = now;
+        session.updated_at = now;
+
+        // Save updated session
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &session);
+
+        // Emit DisputeOpened event
+        env.events().publish(
+            (Symbol::new(&env, "DisputeOpened"),),
+            (session_id, disputer, reason),
         );
 
         Ok(())
