@@ -11,6 +11,8 @@ pub const DEFAULT_DISPUTE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 pub const PLATFORM_FEE_MAX_BPS: u32 = 1000; // 10%
 pub const ESCROW_DURATION_SECONDS: u64 = 7 * 24 * 60 * 60; // Default 7 days
 pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+pub const MIN_UPGRADE_TIMELOCK_SECONDS: u64 = 60; // Minimum 1 minute timelock
+pub const DEFAULT_UPGRADE_TIMELOCK_SECONDS: u64 = 24 * 60 * 60; // Default 1 day timelock
 
 #[contract]
 pub struct SkillSyncContract;
@@ -28,6 +30,8 @@ enum DataKey {
     ExpiryIndex(u64),
     // Track which day buckets have been processed for pagination
     LastProcessedExpiryBucket,
+    // Upgradeability storage keys
+    PendingUpgrade,
 }
 
 #[contracttype]
@@ -38,6 +42,21 @@ pub enum SessionStatus {
     Disputed = 2,
     Cancelled = 3,
     Locked = 4,
+}
+
+/// Pending upgrade information for 2-phase commit upgrade pattern
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    /// Hash of the new WASM code to upgrade to
+    pub new_wasm_hash: Bytes,
+    /// Timestamp when upgrade was proposed
+    pub proposed_at: u64,
+    /// Timestamp when upgrade can be applied (deadline)
+    /// If 0, no timelock is enforced
+    pub deadline: u64,
+    /// Block height at proposal time for additional safety
+    pub proposed_at_ledger: u32,
 }
 
 #[contracttype]
@@ -128,6 +147,10 @@ pub enum Error {
     SessionNotExpired = 16,      // Session has not yet expired
     RefundFailed = 17,           // Failed to refund escrow
     NothingToSweep = 18,         // No expired sessions to sweep
+    UpgradeNotProposed = 19,     // No upgrade has been proposed
+    UpgradeNotReady = 20,        // Upgrade timelock has not elapsed
+    UpgradeDeadlinePassed = 21,  // Upgrade deadline has passed
+    InvalidTimelock = 22,        // Invalid timelock duration
 }
 
 #[contractimpl]
@@ -204,6 +227,203 @@ impl SkillSyncContract {
             None => Err(Error::SessionNotFound),
         }
     }
+
+    // ============================================================================
+    // Upgradeability Functions
+    // ============================================================================
+
+    /// Proposes a contract upgrade with optional timelock.
+    ///
+    /// This function implements the first phase of a 2-phase commit upgrade pattern.
+    /// Only the admin can propose upgrades. The timelock provides a safety window
+    /// during which the upgrade can be reviewed before application.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    /// * `new_wasm_hash` - The hash of the new WASM code to upgrade to
+    /// * `timelock_seconds` - Optional timelock duration in seconds. If 0, uses default.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if upgrade was successfully proposed
+    /// - `Err(Error::Unauthorized)` if caller is not admin
+    /// - `Err(Error::InvalidTimelock)` if timelock is too short
+    ///
+    /// # Events
+    ///
+    /// Emits `UpgradeProposed(new_wasm_hash, deadline, proposed_at)` upon success
+    pub fn propose_upgrade(
+        env: Env,
+        new_wasm_hash: Bytes,
+        timelock_seconds: u64,
+    ) -> Result<(), Error> {
+        // Require admin authorization
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        // Validate timelock (use default if 0)
+        let timelock = if timelock_seconds == 0 {
+            DEFAULT_UPGRADE_TIMELOCK_SECONDS
+        } else {
+            timelock_seconds
+        };
+
+        if timelock < MIN_UPGRADE_TIMELOCK_SECONDS {
+            return Err(Error::InvalidTimelock);
+        }
+
+        let now = env.ledger().timestamp();
+        let deadline = now + timelock;
+        let proposed_at_ledger = env.ledger().sequence();
+
+        // Store pending upgrade
+        let pending = PendingUpgrade {
+            new_wasm_hash: new_wasm_hash.clone(),
+            proposed_at: now,
+            deadline,
+            proposed_at_ledger,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &pending);
+
+        // Emit UpgradeProposed event
+        env.events().publish(
+            (Symbol::new(&env, "UpgradeProposed"),),
+            (new_wasm_hash, deadline, now, proposed_at_ledger),
+        );
+
+        Ok(())
+    }
+
+    /// Applies a previously proposed upgrade.
+    ///
+    /// This function implements the second phase of the 2-phase commit upgrade pattern.
+    /// Can only be called after the timelock has elapsed but before the deadline.
+    /// Only the admin can apply upgrades.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if upgrade was successfully applied
+    /// - `Err(Error::Unauthorized)` if caller is not admin
+    /// - `Err(Error::UpgradeNotProposed)` if no upgrade has been proposed
+    /// - `Err(Error::UpgradeNotReady)` if timelock has not elapsed
+    /// - `Err(Error::UpgradeDeadlinePassed)` if deadline has passed
+    ///
+    /// # Events
+    ///
+    /// Emits `Upgraded(old_version, new_version, wasm_hash)` upon success
+    pub fn apply_upgrade(env: Env) -> Result<(), Error> {
+        // Require admin authorization
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        // Get pending upgrade
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(Error::UpgradeNotProposed)?;
+
+        let now = env.ledger().timestamp();
+
+        // Check timelock has elapsed
+        if now < pending.deadline {
+            return Err(Error::UpgradeNotReady);
+        }
+
+        // Get current version and calculate new version
+        let old_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(VERSION);
+        let new_version = old_version + 1;
+
+        // Update version
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &new_version);
+
+        // Clear pending upgrade
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        // Emit Upgraded event
+        env.events().publish(
+            (Symbol::new(&env, "Upgraded"),),
+            (old_version, new_version, pending.new_wasm_hash, now),
+        );
+
+        Ok(())
+    }
+
+    /// Returns the current contract version.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(VERSION)
+    }
+
+    /// Returns the pending upgrade information if any.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+    }
+
+    /// Cancels a pending upgrade.
+    ///
+    /// Only the admin can cancel an upgrade.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if upgrade was successfully cancelled
+    /// - `Err(Error::Unauthorized)` if caller is not admin
+    /// - `Err(Error::UpgradeNotProposed)` if no upgrade has been proposed
+    ///
+    /// # Events
+    ///
+    /// Emits `UpgradeCancelled(wasm_hash, cancelled_at)` upon success
+    pub fn cancel_upgrade(env: Env) -> Result<(), Error> {
+        // Require admin authorization
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        // Get pending upgrade
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(Error::UpgradeNotProposed)?;
+
+        let now = env.ledger().timestamp();
+
+        // Clear pending upgrade
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+        // Emit UpgradeCancelled event
+        env.events().publish(
+            (Symbol::new(&env, "UpgradeCancelled"),),
+            (pending.new_wasm_hash, now),
+        );
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // End Upgradeability Functions
+    // ============================================================================
 
     pub fn ping(_env: Env) -> u32 {
         1
@@ -3346,5 +3566,402 @@ mod tests {
             }
         }
         assert!(found_event, "TimeoutRefunded event not found");
+    }
+
+    // ============================================================================
+    // Upgradeability Tests
+    // ============================================================================
+
+    #[test]
+    fn test_propose_upgrade_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade with 1 hour timelock
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        let timelock: u64 = 3600; // 1 hour
+        client.propose_upgrade(&wasm_hash, &timelock);
+
+        // Verify pending upgrade exists
+        let pending = client.get_pending_upgrade().unwrap();
+        assert_eq!(pending.new_wasm_hash, wasm_hash);
+        assert!(pending.deadline > pending.proposed_at);
+        assert_eq!(pending.deadline - pending.proposed_at, timelock);
+
+        // Verify UpgradeProposed event was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("UpgradeProposed".to_string()) {
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "UpgradeProposed event not found");
+    }
+
+    #[test]
+    fn test_propose_upgrade_default_timelock() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade with 0 timelock (should use default)
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&wasm_hash, &0);
+
+        // Verify pending upgrade uses default timelock
+        let pending = client.get_pending_upgrade().unwrap();
+        assert_eq!(pending.deadline - pending.proposed_at, DEFAULT_UPGRADE_TIMELOCK_SECONDS);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_propose_upgrade_by_non_admin_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Try to propose upgrade as non-admin (should panic)
+        let non_admin = Address::generate(&env);
+        env.set_auths(&[soroban_sdk::testutils::AuthorizedInvocation {
+            function: soroban_sdk::testutils::AuthorizedFunction::Contract((
+                contract_id.clone(),
+                Symbol::new(&env, "propose_upgrade"),
+                (Bytes::from_array(&env, &[1u8; 32]), 3600u64).into_val(&env),
+            )),
+            sub_invocations: Vec::new(&env),
+        }]);
+        
+        // This should panic with Unauthorized
+        client.propose_upgrade(&Bytes::from_array(&env, &[1u8; 32]), &3600);
+    }
+
+    #[test]
+    fn test_apply_upgrade_success() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Get initial version
+        let initial_version = client.get_version();
+        assert_eq!(initial_version, VERSION);
+
+        // Propose upgrade with 1 hour timelock
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        let timelock: u64 = 3600;
+        client.propose_upgrade(&wasm_hash, &timelock);
+
+        // Advance time past the deadline
+        env.ledger().set_timestamp(env.ledger().timestamp() + timelock + 1);
+
+        // Apply upgrade
+        client.apply_upgrade();
+
+        // Verify version incremented
+        let new_version = client.get_version();
+        assert_eq!(new_version, initial_version + 1);
+
+        // Verify pending upgrade cleared
+        assert!(client.get_pending_upgrade().is_none());
+
+        // Verify Upgraded event was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("Upgraded".to_string()) {
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "Upgraded event not found");
+    }
+
+    #[test]
+    #[should_panic(expected = "UpgradeNotReady")]
+    fn test_apply_upgrade_before_deadline_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade with 1 hour timelock
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        let timelock: u64 = 3600;
+        client.propose_upgrade(&wasm_hash, &timelock);
+
+        // Try to apply upgrade before deadline (should panic)
+        client.apply_upgrade();
+    }
+
+    #[test]
+    #[should_panic(expected = "UpgradeNotProposed")]
+    fn test_apply_upgrade_without_proposal_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Try to apply upgrade without proposing (should panic)
+        client.apply_upgrade();
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_apply_upgrade_by_non_admin_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade as admin
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        let timelock: u64 = 3600;
+        client.propose_upgrade(&wasm_hash, &timelock);
+
+        // Advance time past the deadline
+        env.ledger().set_timestamp(env.ledger().timestamp() + timelock + 1);
+
+        // Try to apply upgrade as non-admin (should panic)
+        let non_admin = Address::generate(&env);
+        env.set_auths(&[soroban_sdk::testutils::AuthorizedInvocation {
+            function: soroban_sdk::testutils::AuthorizedFunction::Contract((
+                contract_id.clone(),
+                Symbol::new(&env, "apply_upgrade"),
+                ().into_val(&env),
+            )),
+            sub_invocations: Vec::new(&env),
+        }]);
+        
+        client.apply_upgrade();
+    }
+
+    #[test]
+    fn test_cancel_upgrade_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&wasm_hash, &3600);
+
+        // Verify pending upgrade exists
+        assert!(client.get_pending_upgrade().is_some());
+
+        // Cancel upgrade
+        client.cancel_upgrade();
+
+        // Verify pending upgrade cleared
+        assert!(client.get_pending_upgrade().is_none());
+
+        // Verify UpgradeCancelled event was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("UpgradeCancelled".to_string()) {
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "UpgradeCancelled event not found");
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_cancel_upgrade_by_non_admin_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose upgrade
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&wasm_hash, &3600);
+
+        // Try to cancel upgrade as non-admin (should panic)
+        env.set_auths(&[soroban_sdk::testutils::AuthorizedInvocation {
+            function: soroban_sdk::testutils::AuthorizedFunction::Contract((
+                contract_id.clone(),
+                Symbol::new(&env, "cancel_upgrade"),
+                ().into_val(&env),
+            )),
+            sub_invocations: Vec::new(&env),
+        }]);
+        
+        client.cancel_upgrade();
+    }
+
+    #[test]
+    fn test_version_increments_on_multiple_upgrades() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        let initial_version = client.get_version();
+
+        // Perform multiple upgrades
+        for i in 0..3 {
+            let wasm_hash = Bytes::from_array(&env, &[(i + 1) as u8; 32]);
+            let timelock: u64 = 60; // Short timelock for testing
+            
+            client.propose_upgrade(&wasm_hash, &timelock);
+            
+            // Advance time past deadline
+            let current_time = env.ledger().timestamp();
+            env.ledger().set_timestamp(current_time + timelock + 1);
+            
+            client.apply_upgrade();
+        }
+
+        // Verify version incremented 3 times
+        assert_eq!(client.get_version(), initial_version + 3);
+    }
+
+    #[test]
+    fn test_get_version_returns_default_when_not_set() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Version should be set during init
+        assert_eq!(client.get_version(), VERSION);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidTimelock")]
+    fn test_propose_upgrade_with_invalid_timelock_blocked() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Try to propose upgrade with timelock below minimum (should panic)
+        let wasm_hash = Bytes::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&wasm_hash, &30); // Less than MIN_UPGRADE_TIMELOCK_SECONDS (60)
+    }
+
+    #[test]
+    fn test_propose_upgrade_overwrites_existing() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Propose first upgrade
+        let wasm_hash1 = Bytes::from_array(&env, &[1u8; 32]);
+        client.propose_upgrade(&wasm_hash1, &3600);
+
+        let pending1 = client.get_pending_upgrade().unwrap();
+
+        // Propose second upgrade (should overwrite)
+        let wasm_hash2 = Bytes::from_array(&env, &[2u8; 32]);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 100);
+        client.propose_upgrade(&wasm_hash2, &7200);
+
+        let pending2 = client.get_pending_upgrade().unwrap();
+
+        // Verify second upgrade replaced first
+        assert_eq!(pending2.new_wasm_hash, wasm_hash2);
+        assert_ne!(pending2.proposed_at, pending1.proposed_at);
+        assert_eq!(pending2.deadline - pending2.proposed_at, 7200);
     }
 }
