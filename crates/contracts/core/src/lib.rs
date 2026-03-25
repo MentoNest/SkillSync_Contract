@@ -38,6 +38,7 @@ pub enum SessionStatus {
     Disputed = 2,
     Cancelled = 3,
     Locked = 4,
+    Resolved = 5,
 }
 
 #[contracttype]
@@ -102,6 +103,10 @@ pub struct Session {
     pub payer_approved: bool,
     pub payee_approved: bool,
     pub approved_at: u64,
+    // Resolution fields for dispute resolution
+    pub resolved_at: u64,
+    pub resolver: Option<Address>,
+    pub resolution_note: Option<Bytes>,
 }
 
 const VERSION: u32 = 1;
@@ -128,6 +133,9 @@ pub enum Error {
     SessionNotExpired = 16,      // Session has not yet expired
     RefundFailed = 17,           // Failed to refund escrow
     NothingToSweep = 18,         // No expired sessions to sweep
+    InvalidResolutionAmount = 19, // Resolution amounts don't sum to available amount
+    SessionNotDisputed = 20,     // Session is not in Disputed status
+    ResolutionFeeError = 21,     // Error calculating resolution fees
 }
 
 #[contractimpl]
@@ -350,6 +358,9 @@ impl SkillSyncContract {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         // Store session (this also checks for duplicate session_id)
@@ -750,6 +761,112 @@ impl SkillSyncContract {
 
         Ok(total_refund)
     }
+
+    /// Resolves a disputed escrow by splitting funds between payer and payee.
+    ///
+    /// This function can only be called by the admin/arbiter. It allows for partial
+    /// refunds to the payer and partial payouts to the beneficiary, with fee deduction.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment
+    /// * `session_id` - The unique session identifier
+    /// * `to_payer` - Amount to refund to the payer
+    /// * `to_payee` - Amount to pay to the payee (beneficiary)
+    /// * `note` - Optional resolution note/reason
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if dispute was successfully resolved
+    /// - `Err(Error::SessionNotFound)` if session doesn't exist
+    /// - `Err(Error::SessionNotDisputed)` if session status is not Disputed
+    /// - `Err(Error::Unauthorized)` if caller is not admin/arbiter
+    /// - `Err(Error::InvalidResolutionAmount)` if amounts don't sum correctly
+    /// - `Err(Error::TransferError)` if token transfer fails
+    ///
+    /// # Events
+    ///
+    /// Emits `DisputeResolved { session_id, to_payer, to_payee, fee_total }` upon success
+    pub fn resolve_dispute(
+        env: Env,
+        session_id: Vec<u8>,
+        to_payer: i128,
+        to_payee: i128,
+        note: Option<Bytes>,
+    ) -> Result<(), Error> {
+        // Require admin/arbiter authorization
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        // Retrieve session
+        let mut session = Self::get_session(env.clone(), session_id.clone())
+            .ok_or(Error::SessionNotFound)?;
+
+        // Validate session status is Disputed
+        if session.status != SessionStatus::Disputed {
+            return Err(Error::SessionNotDisputed);
+        }
+
+        // Calculate the platform fee that was already collected when funds were locked
+        let fee = session.amount
+            .checked_mul(session.fee_bps as i128)
+            .ok_or(Error::ResolutionFeeError)?
+            .checked_div(10000)
+            .ok_or(Error::ResolutionFeeError)?;
+
+        // The available amount is the original amount (fee is already taken by platform)
+        let available_amount = session.amount;
+
+        // Validate that the split amounts sum to the available amount
+        let total_split = to_payer
+            .checked_add(to_payee)
+            .ok_or(Error::InvalidResolutionAmount)?;
+        
+        if total_split != available_amount {
+            return Err(Error::InvalidResolutionAmount);
+        }
+
+        // Validate non-negative amounts
+        if to_payer < 0 || to_payee < 0 {
+            return Err(Error::InvalidResolutionAmount);
+        }
+
+        // Create token client
+        let token_client = token::Client::new(&env, &session.asset);
+        let contract_id = env.current_contract_address();
+
+        // Transfer to payer (if any)
+        if to_payer > 0 {
+            token_client.transfer(&contract_id, &session.payer, &to_payer);
+        }
+
+        // Transfer to payee (if any)
+        if to_payee > 0 {
+            token_client.transfer(&contract_id, &session.payee, &to_payee);
+        }
+
+        // Update session status and resolution fields
+        let now = env.ledger().timestamp();
+        session.status = SessionStatus::Resolved;
+        session.updated_at = now;
+        session.resolved_at = now;
+        session.resolver = Some(admin);
+        session.resolution_note = note;
+
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &session);
+
+        // Remove from expiry index since session is resolved
+        Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
+
+        // Emit DisputeResolved event
+        env.events().publish(
+            (Symbol::new(&env, "DisputeResolved"),),
+            (session_id, to_payer, to_payee, fee),
+        );
+
+        Ok(())
+    }
 }
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
@@ -994,6 +1111,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&s);
@@ -1044,6 +1164,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         let s2 = Session { session_id: sid2.clone(), ..s1.clone() };
@@ -1083,6 +1206,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&old);
@@ -1148,6 +1274,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         // store and ensure we can read back (decode) older versions
@@ -1188,6 +1317,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         // First insertion should succeed
@@ -1224,6 +1356,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         let mut session2 = session1.clone();
@@ -1264,6 +1399,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         let session2 = Session { session_id: sid2.clone(), ..session1.clone() };
@@ -1305,6 +1443,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         // First insertion succeeds
@@ -1528,6 +1669,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&session_min);
@@ -2195,6 +2339,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&session).unwrap();
@@ -2232,6 +2379,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&session).unwrap();
@@ -2797,6 +2947,9 @@ mod tests {
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
         };
 
         client.put_session(&session).unwrap();
@@ -3346,5 +3499,606 @@ mod tests {
             }
         }
         assert!(found_event, "TimeoutRefunded event not found");
+    }
+
+    // ============================================================================
+    // resolve_dispute tests
+    // ============================================================================
+
+    #[test]
+    fn test_resolve_dispute_happy_path() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Mint tokens for payer
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let fee = (amount * fee_bps as i128) / 10000;
+        let total = amount + fee;
+        token_client.mint(&payer, &total);
+
+        // Create a disputed session directly
+        let session_id = Bytes::from_array(&env, &[200u8, 201u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+
+        // Store session and fund the contract
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // Record balances before resolution
+        let payer_balance_before = token_client.balance(&payer);
+        let payee_balance_before = token_client.balance(&payee);
+
+        // Resolve dispute: 30% to payer, 70% to payee
+        let to_payer = 300_000_i128;
+        let to_payee = 700_000_i128;
+        let note = Some(Bytes::from_array(&env, &[1u8, 2u8, 3u8]));
+        
+        client.resolve_dispute(&session_id, &to_payer, &to_payee, &note);
+
+        // Verify balances after resolution
+        assert_eq!(token_client.balance(&payer), payer_balance_before + to_payer);
+        assert_eq!(token_client.balance(&payee), payee_balance_before + to_payee);
+
+        // Verify session status
+        let resolved_session = client.get_session(&session_id).unwrap();
+        assert_eq!(resolved_session.status, SessionStatus::Resolved);
+        assert_eq!(resolved_session.resolved_at, now);
+        assert_eq!(resolved_session.resolver, Some(admin));
+        assert_eq!(resolved_session.resolution_note, note);
+    }
+
+    #[test]
+    fn test_resolve_dispute_requires_admin_auth() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_id = Address::generate(&env);
+
+        // Create a disputed session
+        let session_id = Bytes::from_array(&env, &[202u8, 203u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount: 1_000_000,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+
+        // Resolve dispute
+        client.resolve_dispute(&session_id, &500_000, &500_000, &None);
+
+        // Verify admin auth was required
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, admin);
+    }
+
+    #[test]
+    fn test_resolve_dispute_requires_disputed_status() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_id = Address::generate(&env);
+
+        // Create a Locked session (not Disputed)
+        let session_id = Bytes::from_array(&env, &[204u8, 205u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount: 1_000_000,
+            fee_bps: 250,
+            status: SessionStatus::Locked,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+
+        // Try to resolve - should fail because not Disputed
+        let result = client.try_resolve_dispute(&session_id, &500_000, &500_000, &None);
+        assert_eq!(result, Err(Ok(Error::SessionNotDisputed)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_requires_exact_amount_sum() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_id = Address::generate(&env);
+
+        // Create a disputed session with amount = 1_000_000
+        let session_id = Bytes::from_array(&env, &[206u8, 207u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount: 1_000_000,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+
+        // Try to resolve with amounts that don't sum to available amount
+        // Sum is 900_000, but available is 1_000_000
+        let result = client.try_resolve_dispute(&session_id, &400_000, &500_000, &None);
+        assert_eq!(result, Err(Ok(Error::InvalidResolutionAmount)));
+
+        // Try with amounts that sum to more than available
+        let result = client.try_resolve_dispute(&session_id, &600_000, &500_000, &None);
+        assert_eq!(result, Err(Ok(Error::InvalidResolutionAmount)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_zero_split_to_payer() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Create a disputed session
+        let amount = 1_000_000_i128;
+        let session_id = Bytes::from_array(&env, &[208u8, 209u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // Resolve with 0 to payer, all to payee
+        client.resolve_dispute(&session_id, &0, &amount, &None);
+
+        // Verify session status
+        let resolved_session = client.get_session(&session_id).unwrap();
+        assert_eq!(resolved_session.status, SessionStatus::Resolved);
+    }
+
+    #[test]
+    fn test_resolve_dispute_zero_split_to_payee() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Create a disputed session
+        let amount = 1_000_000_i128;
+        let session_id = Bytes::from_array(&env, &[210u8, 211u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // Resolve with all to payer, 0 to payee (full refund)
+        client.resolve_dispute(&session_id, &amount, &0, &None);
+
+        // Verify session status
+        let resolved_session = client.get_session(&session_id).unwrap();
+        assert_eq!(resolved_session.status, SessionStatus::Resolved);
+    }
+
+    #[test]
+    fn test_resolve_dispute_rejects_negative_amounts() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_id = Address::generate(&env);
+
+        // Create a disputed session
+        let session_id = Bytes::from_array(&env, &[212u8, 213u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount: 1_000_000,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+
+        // Try with negative to_payer
+        let result = client.try_resolve_dispute(&session_id, &-100, &1_000_100, &None);
+        assert_eq!(result, Err(Ok(Error::InvalidResolutionAmount)));
+
+        // Try with negative to_payee
+        let result = client.try_resolve_dispute(&session_id, &1_000_100, &-100, &None);
+        assert_eq!(result, Err(Ok(Error::InvalidResolutionAmount)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Create a disputed session
+        let amount = 1_000_000_i128;
+        let fee_bps = 250u32;
+        let session_id = Bytes::from_array(&env, &[214u8, 215u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // Resolve dispute
+        let to_payer = 400_000_i128;
+        let to_payee = 600_000_i128;
+        client.resolve_dispute(&session_id, &to_payer, &to_payee, &None);
+
+        // Verify DisputeResolved event was emitted
+        let events = env.events().all();
+        let mut found_event = false;
+        for event in events {
+            if let Some(topics) = event.2.get(0) {
+                if let Ok(symbol) = Symbol::try_from(topics) {
+                    if symbol.to_string(&env) == Some("DisputeResolved".to_string()) {
+                        found_event = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_event, "DisputeResolved event not found");
+    }
+
+    #[test]
+    fn test_resolve_dispute_idempotency() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Create a disputed session
+        let amount = 1_000_000_i128;
+        let session_id = Bytes::from_array(&env, &[216u8, 217u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // First resolution
+        client.resolve_dispute(&session_id, &500_000, &500_000, &None);
+
+        // Second resolution attempt should fail (session not Disputed anymore)
+        let result = client.try_resolve_dispute(&session_id, &500_000, &500_000, &None);
+        assert_eq!(result, Err(Ok(Error::SessionNotDisputed)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_session_not_found() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Try to resolve non-existent session
+        let non_existent_id = Bytes::from_array(&env, &[255u8, 255u8]);
+        let result = client.try_resolve_dispute(&non_existent_id, &500_000, &500_000, &None);
+        assert_eq!(result, Err(Ok(Error::SessionNotFound)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_50_50_split() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.init(&admin, &250, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        // Setup addresses and token
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract(payer.clone());
+        let token_id = Address::from_contract_id(&env, &token_contract);
+        let token_client = token::Client::new(&env, &token_id);
+
+        // Create a disputed session
+        let amount = 1_000_000_i128;
+        let session_id = Bytes::from_array(&env, &[218u8, 219u8]);
+        let now = env.ledger().timestamp();
+        let session = Session {
+            version: 1,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: token_id.clone(),
+            amount,
+            fee_bps: 250,
+            status: SessionStatus::Disputed,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline: now + DEFAULT_DISPUTE_WINDOW_SECONDS,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+        client.put_session(&session);
+        token_client.mint(&contract_id, &amount);
+
+        // Record balances before
+        let payer_balance_before = token_client.balance(&payer);
+        let payee_balance_before = token_client.balance(&payee);
+
+        // 50-50 split
+        let to_payer = 500_000_i128;
+        let to_payee = 500_000_i128;
+        client.resolve_dispute(&session_id, &to_payer, &to_payee, &None);
+
+        // Verify exact amounts transferred
+        assert_eq!(token_client.balance(&payer), payer_balance_before + to_payer);
+        assert_eq!(token_client.balance(&payee), payee_balance_before + to_payee);
     }
 }
