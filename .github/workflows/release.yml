@@ -41,41 +41,41 @@ jobs:
           set -euo pipefail
           export CARGO_INCREMENTAL=0
           export RUSTFLAGS="-C embed-bitcode=no"
-          cargo build -p skillsync-core \
+          cargo build -p core \
             --target wasm32-unknown-unknown \
             --release \
-            --locked
+            
         
       - name: Strip WASM binary
         run: |
           set -euo pipefail
           wasm-tools strip \
-            target/wasm32-unknown-unknown/release/skillsync_core.wasm \
-            -o target/wasm32-unknown-unknown/release/skillsync_core_stripped.wasm
-          mv target/wasm32-unknown-unknown/release/skillsync_core_stripped.wasm \
-             target/wasm32-unknown-unknown/release/skillsync_core.wasm
+            target/wasm32-unknown-unknown/release/core.wasm \
+            -o target/wasm32-unknown-unknown/release/core_stripped.wasm
+          mv target/wasm32-unknown-unknown/release/core_stripped.wasm \
+             target/wasm32-unknown-unknown/release/core.wasm
 
       - name: Optimize WASM with wasm-opt
         run: |
           set -euo pipefail
           wasm-opt -Oz \
-            target/wasm32-unknown-unknown/release/skillsync_core.wasm \
-            -o target/wasm32-unknown-unknown/release/skillsync_core_opt.wasm
-          mv target/wasm32-unknown-unknown/release/skillsync_core_opt.wasm \
-             target/wasm32-unknown-unknown/release/skillsync_core.wasm
+            target/wasm32-unknown-unknown/release/core.wasm \
+            -o target/wasm32-unknown-unknown/release/core_opt.wasm
+          mv target/wasm32-unknown-unknown/release/core_opt.wasm \
+             target/wasm32-unknown-unknown/release/core.wasm
 
       - name: Generate SHA256 checksums
         run: |
           set -euo pipefail
           cd target/wasm32-unknown-unknown/release
-          sha256sum skillsync_core.wasm > checksums.txt
+          sha256sum core.wasm > checksums.txt
           cat checksums.txt
 
       - name: Create release artifact directory
         run: |
           set -euo pipefail
           mkdir -p release-artifacts
-          cp target/wasm32-unknown-unknown/release/skillsync_core.wasm \
+          cp target/wasm32-unknown-unknown/release/core.wasm \
              release-artifacts/core-${{ github.ref_name }}.wasm
           cp target/wasm32-unknown-unknown/release/checksums.txt \
              release-artifacts/checksums.txt
@@ -100,29 +100,28 @@ jobs:
         run: |
           set -euo pipefail
           # Clean build artifacts but keep source
-          rm -rf target/wasm32-unknown-unknown/release/skillsync_core.wasm
+          rm -rf target/wasm32-unknown-unknown/release/core.wasm
           
           # Rebuild from scratch
           export CARGO_INCREMENTAL=0
           export RUSTFLAGS="-C embed-bitcode=no"
-          cargo build -p skillsync-core \
+          cargo build -p core \
             --target wasm32-unknown-unknown \
-            --release \
-            --locked
+            --release
           
           # Strip again
           wasm-tools strip \
-            target/wasm32-unknown-unknown/release/skillsync_core.wasm \
-            -o target/wasm32-unknown-unknown/release/skillsync_core_stripped.wasm
-          mv target/wasm32-unknown-unknown/release/skillsync_core_stripped.wasm \
-             target/wasm32-unknown-unknown/release/skillsync_core.wasm
+            target/wasm32-unknown-unknown/release/core.wasm \
+            -o target/wasm32-unknown-unknown/release/core_stripped.wasm
+          mv target/wasm32-unknown-unknown/release/core_stripped.wasm \
+             target/wasm32-unknown-unknown/release/core.wasm
           
           # Optimize again
           wasm-opt -Oz \
-            target/wasm32-unknown-unknown/release/skillsync_core.wasm \
-            -o target/wasm32-unknown-unknown/release/skillsync_core_opt.wasm
-          mv target/wasm32-unknown-unknown/release/skillsync_core_opt.wasm \
-             target/wasm32-unknown-unknown/release/skillsync_core.wasm
+            target/wasm32-unknown-unknown/release/core.wasm \
+            -o target/wasm32-unknown-unknown/release/core_opt.wasm
+          mv target/wasm32-unknown-unknown/release/core_opt.wasm \
+             target/wasm32-unknown-unknown/release/core.wasm
           
           # Verify checkpoint
           echo "=== Verification Build Complete ==="
@@ -133,7 +132,7 @@ jobs:
           cd target/wasm32-unknown-unknown/release
           
           # Compute fresh checksum
-          sha256sum skillsync_core.wasm > fresh-checksum.txt
+          sha256sum core.wasm > fresh-checksum.txt
           cat fresh-checksum.txt
           
           # Extract hash from first build
