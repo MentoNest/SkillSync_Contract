@@ -65,9 +65,9 @@ jobs:
       run: cargo build --release --locked
       
     - name: Build WASM
-      run: cargo build -p skillsync-core --target wasm32-unknown-unknown --release --locked
+      run: cargo build -p core --target wasm32-unknown-unknown --release --locked
       
     - name: Verify WASM artifact exists
       run: |
-        ls -la target/wasm32-unknown-unknown/release/skillsync_core.wasm
-        file target/wasm32-unknown-unknown/release/skillsync_core.wasm
+        ls -la target/wasm32-unknown-unknown/release/core.wasm
+        file target/wasm32-unknown-unknown/release/core.wasm
