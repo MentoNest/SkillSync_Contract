@@ -35,6 +35,8 @@ enum DataKey {
     PendingUpgrade,
     // Fee configuration
     FeeOnRefunds,
+    // Reputation system
+    MentorReputation(Address),
 }
 
 #[contracttype]
@@ -130,6 +132,34 @@ pub struct Session {
     pub resolution_note: Option<Bytes>,
 }
 
+/// Mentor reputation and activity metrics
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MentorReputation {
+    /// Total number of completed sessions
+    pub total_sessions: u32,
+    /// Sum of all ratings received (for calculating average)
+    pub total_rating_sum: u32,
+    /// Number of ratings received
+    pub rating_count: u32,
+    /// Reliability score (0-100): based on on-time completion, dispute rate, etc.
+    pub reliability_score: u32,
+    /// Last updated timestamp
+    pub updated_at: u64,
+}
+
+impl Default for MentorReputation {
+    fn default() -> Self {
+        MentorReputation {
+            total_sessions: 0,
+            total_rating_sum: 0,
+            rating_count: 0,
+            reliability_score: 50, // Start with neutral score
+            updated_at: 0,
+        }
+    }
+}
+
 const VERSION: u32 = 1;
 
 #[contracterror]
@@ -162,6 +192,8 @@ pub enum Error {
     SessionNotDisputed = 24,     // Session is not in Disputed status
     ResolutionFeeError = 25,     // Error calculating resolution fees
     FeeCalculationOverflow = 26, // Fee calculation overflow/underflow
+    InvalidRating = 27,          // Rating value is invalid (must be 1-5)
+    ReputationOverflow = 28,     // Reputation calculation overflow
 }
 
 #[contractimpl]
@@ -643,10 +675,10 @@ impl SkillSyncContract {
         let contract_id = env.current_contract_address();
         token_client.transfer(&payer, &contract_id, &total_amount);
 
-        // Emit FundsLocked event
+        // Emit FundsLocked event with mentor_id (payee), mentee_id (payer), amount, and session_id
         env.events().publish(
             (Symbol::new(&env, "FundsLocked"),),
-            (session_id, payer, payee, amount, fee),
+            (session_id.clone(), payee.clone(), payer.clone(), amount, fee),
         );
 
         Ok(())
@@ -740,8 +772,12 @@ impl SkillSyncContract {
         // Emit SessionCompleted event
         env.events().publish(
             (Symbol::new(&env, "SessionCompleted"),),
-            (session_id, session.payee.clone(), net_amount, fee),
+            (session_id.clone(), session.payer.clone(), session.payee.clone(), now),
         );
+
+        // Update mentor reputation (payee gets reputation boost)
+        // Pass None for rating - can be added later via separate rating function
+        let _ = Self::update_mentor_reputation(env.clone(), session.payee.clone(), None);
 
         Ok(())
     }
@@ -827,10 +863,10 @@ impl SkillSyncContract {
         let key = DataKey::Session(session_id.clone());
         env.storage().persistent().set(&key, &session);
 
-        // Emit SessionApproved event
+        // Emit SessionApproved event with session_id, mentee_id (payer), mentor_id (payee)
         env.events().publish(
             (Symbol::new(&env, "SessionApproved"),),
-            (session_id, approver, both_approved),
+            (session_id.clone(), session.payer.clone(), session.payee.clone(), both_approved),
         );
 
         Ok(())
@@ -1212,6 +1248,167 @@ impl SkillSyncContract {
             (session_id, to_payer, to_payee, fee),
         );
 
+        Ok(())
+    }
+
+    // ============================================================================
+    // Reputation System Functions
+    // ============================================================================
+
+    /// Returns the weighted reputation score for a mentor (payee).
+    /// 
+    /// Formula: weighted_reputation = base_score + (avg_rating * rating_weight) + (sessions * session_weight) + (reliability * reliability_weight)
+    /// Where:
+    /// - base_score = 50 (neutral starting point)
+    /// - avg_rating = total_rating_sum / rating_count (or 0 if no ratings)
+    /// - rating_weight = 10 (weight per rating point)
+    /// - session_weight = 2 (weight per completed session)
+    /// - reliability_weight = 1 (weight per reliability point)
+    /// 
+    /// All calculations use integer arithmetic to ensure determinism.
+    /// Maximum possible score: 50 + (5*10) + (u32::MAX*2) + (100*1) but capped at u32::MAX
+    /// 
+    /// # Arguments
+    /// 
+    /// * `env` - The contract environment
+    /// * `mentor_id` - The address of the mentor (payee)
+    /// 
+    /// # Returns
+    /// 
+    /// Weighted reputation score as u32 (capped at u32::MAX)
+    pub fn get_weighted_reputation(env: Env, mentor_id: Address) -> Result<u32, Error> {
+        let reputation = Self::get_mentor_reputation(env.clone(), mentor_id.clone())?;
+        
+        // Constants for weighting (can be tuned based on desired emphasis)
+        const RATING_WEIGHT: u32 = 10;      // Each rating point contributes 10 points
+        const SESSION_WEIGHT: u32 = 2;       // Each session contributes 2 points
+        const RELIABILITY_WEIGHT: u32 = 1;   // Each reliability point contributes 1 point
+        
+        // Calculate average rating (integer division, floor rounding)
+        let avg_rating = if reputation.rating_count > 0 {
+            reputation.total_rating_sum / reputation.rating_count
+        } else {
+            0
+        };
+        
+        // Calculate weighted components
+        let rating_component = avg_rating
+            .checked_mul(RATING_WEIGHT)
+            .ok_or(Error::ReputationOverflow)?;
+        
+        let session_component = reputation
+            .total_sessions
+            .checked_mul(SESSION_WEIGHT)
+            .ok_or(Error::ReputationOverflow)?;
+        
+        let reliability_component = reputation
+            .reliability_score
+            .checked_mul(RELIABILITY_WEIGHT)
+            .ok_or(Error::ReputationOverflow)?;
+        
+        // Sum all components with base score
+        let base_score: u32 = 50;
+        let total = base_score
+            .checked_add(rating_component)
+            .and_then(|acc| acc.checked_add(session_component))
+            .and_then(|acc| acc.checked_add(reliability_component))
+            .ok_or(Error::ReputationOverflow)?;
+        
+        Ok(total)
+    }
+
+    /// Retrieves the reputation data for a mentor.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `env` - The contract environment
+    /// * `mentor_id` - The address of the mentor
+    /// 
+    /// # Returns
+    /// 
+    /// MentorReputation struct with current reputation metrics
+    pub fn get_mentor_reputation(env: Env, mentor_id: Address) -> Result<MentorReputation, Error> {
+        let key = DataKey::MentorReputation(mentor_id);
+        
+        Ok(env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| MentorReputation::default()))
+    }
+
+    /// Updates mentor reputation after a successful session completion.
+    /// 
+    /// This function:
+    /// 1. Increments total_sessions counter
+    /// 2. Optionally updates rating if provided
+    /// 3. Recalculates reliability score based on session history
+    /// 4. Updates timestamp
+    /// 
+    /// # Arguments
+    /// 
+    /// * `env` - The contract environment
+    /// * `mentor_id` - The address of the mentor (payee)
+    /// * `rating` - Optional rating (1-5) given by mentee
+    /// 
+    /// # Returns
+    /// 
+    /// - `Ok(())` if reputation was successfully updated
+    /// - `Err(Error::InvalidRating)` if rating is not in range 1-5
+    pub fn update_mentor_reputation(
+        env: Env,
+        mentor_id: Address,
+        rating: Option<u32>,
+    ) -> Result<(), Error> {
+        let mut reputation = Self::get_mentor_reputation(env.clone(), mentor_id.clone())?;
+        
+        // Increment session count
+        reputation.total_sessions = reputation
+            .total_sessions
+            .checked_add(1)
+            .ok_or(Error::ReputationOverflow)?;
+        
+        // Update rating if provided
+        if let Some(r) = rating {
+            // Validate rating is between 1 and 5
+            if r < 1 || r > 5 {
+                return Err(Error::InvalidRating);
+            }
+            
+            reputation.total_rating_sum = reputation
+                .total_rating_sum
+                .checked_add(r)
+                .ok_or(Error::ReputationOverflow)?;
+            
+            reputation.rating_count = reputation
+                .rating_count
+                .checked_add(1)
+                .ok_or(Error::ReputationOverflow)?;
+        }
+        
+        // Update reliability score (simplified calculation)
+        // In production, this could be more sophisticated based on:
+        // - Dispute rate
+        // - On-time completion rate
+        // - Cancellation rate
+        // For now, we use a simple formula:
+        // reliability = min(100, base + session_bonus)
+        // where session_bonus increases with more sessions (diminishing returns)
+        let session_bonus = (reputation.total_sessions / 10).min(50); // Max 50 bonus at 500+ sessions
+        reputation.reliability_score = (50 + session_bonus).min(100);
+        
+        // Update timestamp
+        reputation.updated_at = env.ledger().timestamp();
+        
+        // Save to storage
+        let key = DataKey::MentorReputation(mentor_id);
+        env.storage().persistent().set(&key, &reputation);
+        
+        // Emit ReputationUpdated event
+        env.events().publish(
+            (Symbol::new(&env, "ReputationUpdated"),),
+            (mentor_id, reputation.total_sessions, reputation.rating_count),
+        );
+        
         Ok(())
     }
 }
@@ -5622,5 +5819,151 @@ mod tests {
         assert_eq!(disputed_session.status, SessionStatus::Disputed);
         assert!(disputed_session.dispute_opened_at > 0);
         assert_eq!(disputed_session.updated_at, disputed_session.dispute_opened_at);
+    }
+
+    #[test]
+    fn test_reputation_initial_state() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        let mentor = Address::generate(&env);
+        
+        // Get initial reputation (should be default)
+        let reputation = client.get_mentor_reputation(&mentor);
+        assert_eq!(reputation.total_sessions, 0);
+        assert_eq!(reputation.total_rating_sum, 0);
+        assert_eq!(reputation.rating_count, 0);
+        assert_eq!(reputation.reliability_score, 50); // Default neutral score
+        assert_eq!(reputation.updated_at, 0);
+
+        // Calculate weighted reputation (should be base 50 + 0 + 0 + 50 = 100)
+        let weighted = client.get_weighted_reputation(&mentor);
+        assert_eq!(weighted, 100); // 50 base + 0 rating + 0 sessions + 50 reliability
+    }
+
+    #[test]
+    fn test_reputation_updates_with_sessions() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        let mentor = Address::generate(&env);
+        
+        // Update reputation 5 times (simulating 5 completed sessions)
+        for _ in 0..5 {
+            let _ = client.update_mentor_reputation(&mentor, &None);
+        }
+
+        let reputation = client.get_mentor_reputation(&mentor);
+        assert_eq!(reputation.total_sessions, 5);
+        assert_eq!(reputation.total_rating_sum, 0);
+        assert_eq!(reputation.rating_count, 0);
+        assert!(reputation.updated_at > 0);
+
+        // Weighted reputation: 50 base + 0 rating + (5 * 2) sessions + 50 reliability = 110
+        let weighted = client.get_weighted_reputation(&mentor);
+        assert_eq!(weighted, 110);
+    }
+
+    #[test]
+    fn test_reputation_with_ratings() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        let mentor = Address::generate(&env);
+        
+        // Update with ratings: 5, 4, 5 (average = 4.67, floor to 4)
+        let _ = client.update_mentor_reputation(&mentor, &Some(5));
+        let _ = client.update_mentor_reputation(&mentor, &Some(4));
+        let _ = client.update_mentor_reputation(&mentor, &Some(5));
+
+        let reputation = client.get_mentor_reputation(&mentor);
+        assert_eq!(reputation.total_sessions, 3);
+        assert_eq!(reputation.total_rating_sum, 14); // 5+4+5
+        assert_eq!(reputation.rating_count, 3);
+        assert!(reputation.updated_at > 0);
+
+        // Average rating = 14 / 3 = 4 (floor division)
+        // Weighted: 50 base + (4 * 10) rating + (3 * 2) sessions + 50 reliability = 146
+        let weighted = client.get_weighted_reputation(&mentor);
+        assert_eq!(weighted, 146);
+    }
+
+    #[test]
+    fn test_invalid_rating_rejected() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        let mentor = Address::generate(&env);
+        
+        // Rating 0 should fail
+        let result = client.try_update_mentor_reputation(&mentor, &Some(0));
+        assert!(result.is_err());
+
+        // Rating 6 should fail
+        let result = client.try_update_mentor_reputation(&mentor, &Some(6));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reputation_formula_determinism() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+        let mentor1 = Address::generate(&env);
+        let mentor2 = Address::generate(&env);
+        
+        // Same inputs should produce same outputs (deterministic)
+        for _ in 0..10 {
+            let _ = client.update_mentor_reputation(&mentor1, &Some(5));
+            let _ = client.update_mentor_reputation(&mentor2, &Some(5));
+        }
+
+        let rep1 = client.get_mentor_reputation(&mentor1);
+        let rep2 = client.get_mentor_reputation(&mentor2);
+        
+        assert_eq!(rep1.total_sessions, rep2.total_sessions);
+        assert_eq!(rep1.total_rating_sum, rep2.total_rating_sum);
+        assert_eq!(rep1.rating_count, rep2.rating_count);
+        assert_eq!(rep1.reliability_score, rep2.reliability_score);
+
+        let weighted1 = client.get_weighted_reputation(&mentor1);
+        let weighted2 = client.get_weighted_reputation(&mentor2);
+        
+        assert_eq!(weighted1, weighted2);
     }
 }
