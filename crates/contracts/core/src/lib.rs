@@ -37,6 +37,8 @@ enum DataKey {
     FeeOnRefunds,
     // Reputation system
     MentorReputation(Address),
+    // Nonce for replay protection
+    Nonce(Address),
 }
 if session.status != SessionStatus::Locked {
             return Err(Error::InvalidDisputeState);
@@ -209,6 +211,7 @@ pub enum Error {
     InvalidRating = 27,          // Rating value is invalid (must be 1-5)
     ReputationOverflow = 28,     // Reputation calculation overflow
     InvalidDisputeState = 29,    // Session is not in a valid state for dispute
+    NonceAlreadyUsed = 30,       // Nonce already used for replay protection
 }
 }
 
@@ -493,6 +496,11 @@ impl SkillSyncContract {
         1
     }
 
+    /// Get the current nonce for an address (for replay protection)
+    pub fn nonce(env: Env, addr: Address) -> u64 {
+        get_nonce(&env, &addr)
+    }
+
     pub fn get_dispute_window(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -727,7 +735,10 @@ impl SkillSyncContract {
     /// # Events
     ///
     /// Emits `SessionCompleted(session_id, payee, amount, fee)` upon success
-    pub fn complete_session(env: Env, session_id: Vec<u8>, caller: Address) -> Result<(), Error> {
+    pub fn complete_session(env: Env, session_id: Vec<u8>, caller: Address, nonce: u64) -> Result<(), Error> {
+        // Replay protection: ensure nonce hasn't been used
+        use_nonce(&env, &caller, nonce)?;
+
         // Require caller authorization
         caller.require_auth();
 
@@ -1444,6 +1455,26 @@ fn read_admin(env: &Env) -> Result<Address, Error> {
         .instance()
         .get(&DataKey::Admin)
         .ok_or(Error::NotInitialized)
+}
+
+/// Get the current nonce for an address (for replay protection)
+fn get_nonce(env: &Env, addr: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Nonce(addr.clone()))
+        .unwrap_or(0)
+}
+
+/// Consume a nonce for replay protection. Returns error if nonce already used.
+fn use_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), Error> {
+    let current = get_nonce(env, addr);
+    if nonce <= current {
+        return Err(Error::NonceAlreadyUsed);
+    }
+    env.storage()
+        .persistent()
+        .set(&DataKey::Nonce(addr.clone()), &nonce);
+    Ok(())
 }
 
 fn validate_dispute_window(seconds: u64) -> Result<(), Error> {
