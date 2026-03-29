@@ -16,6 +16,7 @@ Thumbs.db
 
 # Contract build artifacts
 contracts/target/
+contracts/*/target/
 **/*.wasm
 **/*.wasm.gz
 **/metadata.json
