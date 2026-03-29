@@ -103,7 +103,7 @@ fn release_sends_fee_to_treasury() {
     let amount: i128 = 1_000_000;
     token_asset.mint(&contract_id, &amount);
 
-    let (mentor_share, platform_fee) = client.release(&token_id, &mentor, &amount, &Some(42));
+    let (mentor_share, platform_fee) = client.release(&token_id, &mentor, &amount, &Some(42), &1);
     assert_eq!(token_client.balance(&mentor), mentor_share);
     assert_eq!(token_client.balance(&treasury), platform_fee);
     assert_eq!(token_client.balance(&contract_id), 0);
@@ -145,7 +145,7 @@ fn release_with_zero_fee_sends_all_to_mentor() {
     let amount: i128 = 10_000;
     token_asset.mint(&contract_id, &amount);
 
-    let (mentor_share, platform_fee) = client.release(&token_id, &mentor, &amount, &None);
+    let (mentor_share, platform_fee) = client.release(&token_id, &mentor, &amount, &None, &1);
     assert_eq!(mentor_share, amount);
     assert_eq!(platform_fee, 0);
     assert_eq!(token_client.balance(&mentor), amount);
@@ -173,7 +173,7 @@ fn release_with_full_fee_sends_all_to_treasury() {
     let amount: i128 = 10_000;
     token_asset.mint(&contract_id, &amount);
 
-    let (mentor_share, platform_fee) = client.release(&token_id, &mentor, &amount, &None);
+    let (mentor_share, platform_fee) = client.release(&token_id, &mentor, &amount, &None, &1);
     assert_eq!(mentor_share, 0);
     assert_eq!(platform_fee, amount);
     assert_eq!(token_client.balance(&mentor), 0);
@@ -195,4 +195,103 @@ fn split_handles_large_amounts() {
     assert!(mentor_share >= 0);
     assert!(platform_fee >= 0);
     assert_eq!(mentor_share + platform_fee, amount);
+}
+
+#[test]
+fn replay_attack_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let mentor = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, FeeSplitContract);
+    let client = FeeSplitContractClient::new(&env, &contract_id);
+    client.init(&admin, &treasury, &1_000);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin.clone());
+    let token_asset = token::StellarAssetClient::new(&env, &token_id);
+
+    let amount: i128 = 100_000;
+    token_asset.mint(&contract_id, &amount);
+
+    // First release succeeds with nonce 1
+    client.release(&token_id, &mentor, &50_000, &None, &1);
+    assert_eq!(client.nonce(&mentor), 1);
+
+    // Second release must use higher nonce (2)
+    client.release(&token_id, &mentor, &25_000, &None, &2);
+    assert_eq!(client.nonce(&mentor), 2);
+}
+
+#[test]
+fn nonce_must_increment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let mentor = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, FeeSplitContract);
+    let client = FeeSplitContractClient::new(&env, &contract_id);
+    client.init(&admin, &treasury, &500);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin.clone());
+    let token_asset = token::StellarAssetClient::new(&env, &token_id);
+
+    token_asset.mint(&contract_id, &1_000_000);
+
+    // Initial nonce is 0
+    assert_eq!(client.nonce(&mentor), 0);
+
+    // Nonce 1 succeeds
+    client.release(&token_id, &mentor, &1_000, &None, &1);
+    assert_eq!(client.nonce(&mentor), 1);
+
+    // Nonce 2 succeeds
+    client.release(&token_id, &mentor, &1_000, &None, &2);
+    assert_eq!(client.nonce(&mentor), 2);
+
+    // Can skip nonces (nonce 5 succeeds)
+    client.release(&token_id, &mentor, &1_000, &None, &5);
+    assert_eq!(client.nonce(&mentor), 5);
+}
+
+#[test]
+fn nonces_are_per_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let mentor1 = Address::generate(&env);
+    let mentor2 = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, FeeSplitContract);
+    let client = FeeSplitContractClient::new(&env, &contract_id);
+    client.init(&admin, &treasury, &500);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin.clone());
+    let token_asset = token::StellarAssetClient::new(&env, &token_id);
+
+    token_asset.mint(&contract_id, &1_000_000);
+
+    // Both mentors start at nonce 0
+    assert_eq!(client.nonce(&mentor1), 0);
+    assert_eq!(client.nonce(&mentor2), 0);
+
+    // mentor1 uses nonce 1
+    client.release(&token_id, &mentor1, &1_000, &None, &1);
+    assert_eq!(client.nonce(&mentor1), 1);
+    assert_eq!(client.nonce(&mentor2), 0);
+
+    // mentor2 can also use nonce 1 (independent)
+    client.release(&token_id, &mentor2, &1_000, &None, &1);
+    assert_eq!(client.nonce(&mentor1), 1);
+    assert_eq!(client.nonce(&mentor2), 1);
 }

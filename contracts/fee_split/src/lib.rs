@@ -12,6 +12,7 @@ pub enum DataKey {
     Admin,
     Treasury,
     FeeBps,
+    Nonce(Address),
 }
 
 #[contracttype]
@@ -38,6 +39,7 @@ pub enum Error {
     NotInitialized = 2,
     InvalidFeeBps = 3,
     NegativeAmount = 4,
+    NonceAlreadyUsed = 5,
 }
 
 #[contract]
@@ -96,6 +98,25 @@ impl FeeSplitContract {
         let platform_fee = amount - mentor_share;
         (mentor_share, platform_fee)
     }
+
+    /// Get current nonce for an address (0 if never used).
+    fn get_nonce(env: &Env, addr: &Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Nonce(addr.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Consume nonce: reject if already used, else mark as used.
+    fn use_nonce(env: &Env, addr: &Address, nonce: u64) {
+        let current = Self::get_nonce(env, addr);
+        if nonce <= current {
+            panic_with_error!(env, Error::NonceAlreadyUsed);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nonce(addr.clone()), &nonce);
+    }
 }
 
 #[contractimpl]
@@ -148,13 +169,18 @@ impl FeeSplitContract {
     }
 
     /// Transfer split funds from contract balance to mentor and treasury.
+    /// Requires a unique nonce per mentor to prevent replay attacks.
     pub fn release(
         env: Env,
         token: Address,
         mentor: Address,
         amount: i128,
         booking_id: Option<u64>,
+        nonce: u64,
     ) -> (i128, i128) {
+        // Consume nonce to prevent replay
+        Self::use_nonce(&env, &mentor, nonce);
+
         let (mentor_share, platform_fee) = Self::split_amount(&env, amount);
         let treasury = Self::read_treasury(&env);
         let token_client = token::Client::new(&env, &token);
@@ -172,6 +198,11 @@ impl FeeSplitContract {
             },
         );
         (mentor_share, platform_fee)
+    }
+
+    /// Get current nonce for an address.
+    pub fn nonce(env: Env, addr: Address) -> u64 {
+        Self::get_nonce(&env, &addr)
     }
 
     /// Read the admin address.
