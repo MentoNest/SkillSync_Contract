@@ -15,6 +15,11 @@ pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 pub const MIN_UPGRADE_TIMELOCK_SECONDS: u64 = 60; // Minimum 1 minute timelock
 pub const DEFAULT_UPGRADE_TIMELOCK_SECONDS: u64 = 24 * 60 * 60; // Default 1 day timelock
 
+// Input validation limits
+pub const MAX_SESSION_ID_LEN: u32 = 64;      // Max session ID length
+pub const MAX_NOTE_LEN: u32 = 256;           // Max resolution note length
+pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100 trillion units max
+
 #[contract]
 pub struct SkillSyncContract;
 
@@ -209,6 +214,10 @@ pub enum Error {
     InvalidRating = 27,          // Rating value is invalid (must be 1-5)
     ReputationOverflow = 28,     // Reputation calculation overflow
     InvalidDisputeState = 29,    // Session is not in a valid state for dispute
+    InvalidAddress = 30,         // Invalid or empty address
+    InvalidSessionId = 31,       // Session ID empty or too long
+    InvalidNote = 32,            // Note too long
+    AmountTooLarge = 33,         // Amount exceeds maximum allowed
 }
 }
 
@@ -625,13 +634,9 @@ impl SkillSyncContract {
         fee_bps: u32,
     ) -> Result<(), Error> {
         // Validate inputs
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        if payer == payee {
-            return Err(Error::InvalidAmount);
-        }
+        validate_session_id(&session_id)?;
+        validate_amount(amount)?;
+        validate_different_addresses(&payer, &payee)?;
 
         // Get current timestamp and dispute window
         let now = env.ledger().timestamp();
@@ -1203,6 +1208,9 @@ impl SkillSyncContract {
         to_payee: i128,
         note: Option<Bytes>,
     ) -> Result<(), Error> {
+        // Validate inputs
+        validate_note(&note)?;
+
         // Require admin/arbiter authorization
         let admin = read_admin(&env)?;
         admin.require_auth();
@@ -1456,6 +1464,43 @@ fn validate_dispute_window(seconds: u64) -> Result<(), Error> {
 fn validate_platform_fee_bps(bps: u32) -> Result<(), Error> {
     if bps > PLATFORM_FEE_MAX_BPS {
         return Err(Error::InvalidFeeBps);
+    }
+    Ok(())
+}
+
+/// Validate session ID is not empty and within length limit
+fn validate_session_id(session_id: &Bytes) -> Result<(), Error> {
+    if session_id.len() == 0 || session_id.len() > MAX_SESSION_ID_LEN {
+        return Err(Error::InvalidSessionId);
+    }
+    Ok(())
+}
+
+/// Validate amount is positive and within safe limits
+fn validate_amount(amount: i128) -> Result<(), Error> {
+    if amount <= 0 {
+        return Err(Error::InvalidAmount);
+    }
+    if amount > MAX_AMOUNT {
+        return Err(Error::AmountTooLarge);
+    }
+    Ok(())
+}
+
+/// Validate optional note length
+fn validate_note(note: &Option<Bytes>) -> Result<(), Error> {
+    if let Some(n) = note {
+        if n.len() > MAX_NOTE_LEN {
+            return Err(Error::InvalidNote);
+        }
+    }
+    Ok(())
+}
+
+/// Validate two addresses are different (payer != payee)
+fn validate_different_addresses(addr1: &Address, addr2: &Address) -> Result<(), Error> {
+    if addr1 == addr2 {
+        return Err(Error::InvalidAddress);
     }
     Ok(())
 }
@@ -6133,5 +6178,88 @@ mod tests {
         assert_eq!(session.status, SessionStatus::Disputed);
         assert_eq!(session.dispute_opened_at, ts);
         assert_eq!(session.updated_at, ts);
+    }
+
+    // ── Input validation tests ────────────────────────────────────────────────
+
+    fn setup(env: &Env) -> (Address, SkillSyncContractClient) {
+        env.mock_all_auths_allowing_non_root_auth();
+        let id = env.register_contract(None, SkillSyncContract);
+        let client = SkillSyncContractClient::new(env, &id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+        (id, client)
+    }
+
+    #[test]
+    fn test_lock_funds_zero_amount_rejected() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let session_id = Bytes::from_slice(&env, &[1u8; 8]);
+        let result = client.try_lock_funds(&session_id, &payer, &payee, &asset, &0, &100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lock_funds_negative_amount_rejected() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let session_id = Bytes::from_slice(&env, &[1u8; 8]);
+        let result = client.try_lock_funds(&session_id, &payer, &payee, &asset, &-1, &100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lock_funds_amount_too_large_rejected() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let session_id = Bytes::from_slice(&env, &[1u8; 8]);
+        let result = client.try_lock_funds(&session_id, &payer, &payee, &asset, &(MAX_AMOUNT + 1), &100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lock_funds_same_payer_payee_rejected() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let addr = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let session_id = Bytes::from_slice(&env, &[1u8; 8]);
+        let result = client.try_lock_funds(&session_id, &addr, &addr, &asset, &1000, &100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lock_funds_empty_session_id_rejected() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let session_id = Bytes::from_slice(&env, &[]);
+        let result = client.try_lock_funds(&session_id, &payer, &payee, &asset, &1000, &100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lock_funds_session_id_too_long_rejected() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let session_id = Bytes::from_slice(&env, &[1u8; 65]); // > MAX_SESSION_ID_LEN
+        let result = client.try_lock_funds(&session_id, &payer, &payee, &asset, &1000, &100);
+        assert!(result.is_err());
     }
 }
