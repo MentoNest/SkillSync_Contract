@@ -35,6 +35,8 @@ enum DataKey {
     PendingUpgrade,
     // Fee configuration
     FeeOnRefunds,
+    // Reputation system
+    MentorReputation(Address),
     // Nonce for replay protection
     Nonce(Address),
 }
@@ -169,6 +171,7 @@ pub enum Error {
     InvalidRating = 27,          // Rating value is invalid (must be 1-5)
     ReputationOverflow = 28,     // Reputation calculation overflow
     InvalidDisputeState = 29,    // Session is not in a valid state for dispute
+    NonceAlreadyUsed = 30,       // Nonce already used for replay protection
 }
 }
 
