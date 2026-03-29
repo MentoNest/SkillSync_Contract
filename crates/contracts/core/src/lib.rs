@@ -37,6 +37,8 @@ enum DataKey {
     FeeOnRefunds,
     // Reputation system
     MentorReputation(Address),
+    // Reentrancy guard
+    ReentrancyLock,
 }
 if session.status != SessionStatus::Locked {
             return Err(Error::InvalidDisputeState);
@@ -209,6 +211,7 @@ pub enum Error {
     InvalidRating = 27,          // Rating value is invalid (must be 1-5)
     ReputationOverflow = 28,     // Reputation calculation overflow
     InvalidDisputeState = 29,    // Session is not in a valid state for dispute
+    Reentrancy = 30,             // Reentrant call detected
 }
 }
 
@@ -624,12 +627,17 @@ impl SkillSyncContract {
         amount: i128,
         fee_bps: u32,
     ) -> Result<(), Error> {
+        // Reentrancy guard
+        acquire_lock(&env)?;
+
         // Validate inputs
         if amount <= 0 {
+            release_lock(&env);
             return Err(Error::InvalidAmount);
         }
 
         if payer == payee {
+            release_lock(&env);
             return Err(Error::InvalidAmount);
         }
 
@@ -697,6 +705,7 @@ impl SkillSyncContract {
             (session_id.clone(), payee.clone(), payer.clone(), amount, fee),
         );
 
+        release_lock(&env);
         Ok(())
     }
 
@@ -728,6 +737,9 @@ impl SkillSyncContract {
     ///
     /// Emits `SessionCompleted(session_id, payee, amount, fee)` upon success
     pub fn complete_session(env: Env, session_id: Vec<u8>, caller: Address) -> Result<(), Error> {
+        // Reentrancy guard
+        acquire_lock(&env)?;
+
         // Require caller authorization
         caller.require_auth();
 
@@ -805,6 +817,7 @@ impl SkillSyncContract {
         // Pass None for rating - can be added later via separate rating function
         let _ = Self::update_mentor_reputation(env.clone(), session.payee.clone(), None);
 
+        release_lock(&env);
         Ok(())
     }
 
@@ -1444,6 +1457,20 @@ fn read_admin(env: &Env) -> Result<Address, Error> {
         .instance()
         .get(&DataKey::Admin)
         .ok_or(Error::NotInitialized)
+}
+
+/// Reentrancy guard: acquire lock or return error if already locked
+fn acquire_lock(env: &Env) -> Result<(), Error> {
+    if env.storage().instance().get(&DataKey::ReentrancyLock).unwrap_or(false) {
+        return Err(Error::Reentrancy);
+    }
+    env.storage().instance().set(&DataKey::ReentrancyLock, &true);
+    Ok(())
+}
+
+/// Reentrancy guard: release lock
+fn release_lock(env: &Env) {
+    env.storage().instance().set(&DataKey::ReentrancyLock, &false);
 }
 
 fn validate_dispute_window(seconds: u64) -> Result<(), Error> {
