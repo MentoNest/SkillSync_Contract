@@ -39,7 +39,6 @@ pub enum Error {
     NotInitialized = 2,
     InvalidFeeBps = 3,
     NegativeAmount = 4,
-    Reentrancy = 5,
     Unauthorized = 5,
     Reentrancy = 6,
 }
