@@ -37,6 +37,8 @@ enum DataKey {
     FeeOnRefunds,
     // Reputation system
     MentorReputation(Address),
+    // Reentrancy guard
+    ReentrancyLock,
     // Nonce for replay protection
     Nonce(Address),
 }
@@ -171,6 +173,7 @@ pub enum Error {
     InvalidRating = 27,          // Rating value is invalid (must be 1-5)
     ReputationOverflow = 28,     // Reputation calculation overflow
     InvalidDisputeState = 29,    // Session is not in a valid state for dispute
+    Reentrancy = 30,             // Reentrant call detected
     NonceAlreadyUsed = 30,       // Nonce already used for replay protection
 }
 }
@@ -592,12 +595,17 @@ impl SkillSyncContract {
         amount: i128,
         fee_bps: u32,
     ) -> Result<(), Error> {
+        // Reentrancy guard
+        acquire_lock(&env)?;
+
         // Validate inputs
         if amount <= 0 {
+            release_lock(&env);
             return Err(Error::InvalidAmount);
         }
 
         if payer == payee {
+            release_lock(&env);
             return Err(Error::InvalidAmount);
         }
 
@@ -665,6 +673,7 @@ impl SkillSyncContract {
             (session_id, payer, payee, amount, fee),
         );
 
+        release_lock(&env);
         Ok(())
     }
 
@@ -762,6 +771,7 @@ impl SkillSyncContract {
             (session_id, session.payee.clone(), net_amount, fee),
         );
 
+        release_lock(&env);
         Ok(())
     }
 
@@ -1337,6 +1347,18 @@ fn read_admin(env: &Env) -> Result<Address, Error> {
         .ok_or(Error::NotInitialized)
 }
 
+/// Reentrancy guard: acquire lock or return error if already locked
+fn acquire_lock(env: &Env) -> Result<(), Error> {
+    if env.storage().instance().get(&DataKey::ReentrancyLock).unwrap_or(false) {
+        return Err(Error::Reentrancy);
+    }
+    env.storage().instance().set(&DataKey::ReentrancyLock, &true);
+    Ok(())
+}
+
+/// Reentrancy guard: release lock
+fn release_lock(env: &Env) {
+    env.storage().instance().set(&DataKey::ReentrancyLock, &false);
 /// Get the current nonce for an address (for replay protection)
 fn get_nonce(env: &Env, addr: &Address) -> u64 {
     env.storage()
