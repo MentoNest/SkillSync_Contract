@@ -165,6 +165,11 @@ pub enum Error {
     ResolutionFeeError = 25,     // Error calculating resolution fees
     FeeCalculationOverflow = 26, // Fee calculation overflow/underflow
     NonceAlreadyUsed = 27,       // Nonce already used for replay protection
+    // InvalidRating = 27,          // Rating value is invalid (must be 1-5)
+    InvalidRating = 27,          // Rating value is invalid (must be 1-5)
+    ReputationOverflow = 28,     // Reputation calculation overflow
+    InvalidDisputeState = 29,    // Session is not in a valid state for dispute
+}
 }
 
 #[contractimpl]
@@ -1157,6 +1162,167 @@ impl SkillSyncContract {
             (session_id, to_payer, to_payee, fee),
         );
 
+        Ok(())
+    }
+
+    // ============================================================================
+    // Reputation System Functions
+    // ============================================================================
+
+    /// Returns the weighted reputation score for a mentor (payee).
+    /// 
+    /// Formula: weighted_reputation = base_score + (avg_rating * rating_weight) + (sessions * session_weight) + (reliability * reliability_weight)
+    /// Where:
+    /// - base_score = 50 (neutral starting point)
+    /// - avg_rating = total_rating_sum / rating_count (or 0 if no ratings)
+    /// - rating_weight = 10 (weight per rating point)
+    /// - session_weight = 2 (weight per completed session)
+    /// - reliability_weight = 1 (weight per reliability point)
+    /// 
+    /// All calculations use integer arithmetic to ensure determinism.
+    /// Maximum possible score: 50 + (5*10) + (u32::MAX*2) + (100*1) but capped at u32::MAX
+    /// 
+    /// # Arguments
+    /// 
+    /// * `env` - The contract environment
+    /// * `mentor_id` - The address of the mentor (payee)
+    /// 
+    /// # Returns
+    /// 
+    /// Weighted reputation score as u32 (capped at u32::MAX)
+    pub fn get_weighted_reputation(env: Env, mentor_id: Address) -> Result<u32, Error> {
+        let reputation = Self::get_mentor_reputation(env.clone(), mentor_id.clone())?;
+        
+        // Constants for weighting (can be tuned based on desired emphasis)
+        const RATING_WEIGHT: u32 = 10;      // Each rating point contributes 10 points
+        const SESSION_WEIGHT: u32 = 2;       // Each session contributes 2 points
+        const RELIABILITY_WEIGHT: u32 = 1;   // Each reliability point contributes 1 point
+        
+        // Calculate average rating (integer division, floor rounding)
+        let avg_rating = if reputation.rating_count > 0 {
+            reputation.total_rating_sum / reputation.rating_count
+        } else {
+            0
+        };
+        
+        // Calculate weighted components
+        let rating_component = avg_rating
+            .checked_mul(RATING_WEIGHT)
+            .ok_or(Error::ReputationOverflow)?;
+        
+        let session_component = reputation
+            .total_sessions
+            .checked_mul(SESSION_WEIGHT)
+            .ok_or(Error::ReputationOverflow)?;
+        
+        let reliability_component = reputation
+            .reliability_score
+            .checked_mul(RELIABILITY_WEIGHT)
+            .ok_or(Error::ReputationOverflow)?;
+        
+        // Sum all components with base score
+        let base_score: u32 = 50;
+        let total = base_score
+            .checked_add(rating_component)
+            .and_then(|acc| acc.checked_add(session_component))
+            .and_then(|acc| acc.checked_add(reliability_component))
+            .ok_or(Error::ReputationOverflow)?;
+        
+        Ok(total)
+    }
+
+    /// Retrieves the reputation data for a mentor.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `env` - The contract environment
+    /// * `mentor_id` - The address of the mentor
+    /// 
+    /// # Returns
+    /// 
+    /// MentorReputation struct with current reputation metrics
+    pub fn get_mentor_reputation(env: Env, mentor_id: Address) -> Result<MentorReputation, Error> {
+        let key = DataKey::MentorReputation(mentor_id);
+        
+        Ok(env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| MentorReputation::default()))
+    }
+
+    /// Updates mentor reputation after a successful session completion.
+    /// 
+    /// This function:
+    /// 1. Increments total_sessions counter
+    /// 2. Optionally updates rating if provided
+    /// 3. Recalculates reliability score based on session history
+    /// 4. Updates timestamp
+    /// 
+    /// # Arguments
+    /// 
+    /// * `env` - The contract environment
+    /// * `mentor_id` - The address of the mentor (payee)
+    /// * `rating` - Optional rating (1-5) given by mentee
+    /// 
+    /// # Returns
+    /// 
+    /// - `Ok(())` if reputation was successfully updated
+    /// - `Err(Error::InvalidRating)` if rating is not in range 1-5
+    pub fn update_mentor_reputation(
+        env: Env,
+        mentor_id: Address,
+        rating: Option<u32>,
+    ) -> Result<(), Error> {
+        let mut reputation = Self::get_mentor_reputation(env.clone(), mentor_id.clone())?;
+        
+        // Increment session count
+        reputation.total_sessions = reputation
+            .total_sessions
+            .checked_add(1)
+            .ok_or(Error::ReputationOverflow)?;
+        
+        // Update rating if provided
+        if let Some(r) = rating {
+            // Validate rating is between 1 and 5
+            if r < 1 || r > 5 {
+                return Err(Error::InvalidRating);
+            }
+            
+            reputation.total_rating_sum = reputation
+                .total_rating_sum
+                .checked_add(r)
+                .ok_or(Error::ReputationOverflow)?;
+            
+            reputation.rating_count = reputation
+                .rating_count
+                .checked_add(1)
+                .ok_or(Error::ReputationOverflow)?;
+        }
+        
+        // Update reliability score (simplified calculation)
+        // In production, this could be more sophisticated based on:
+        // - Dispute rate
+        // - On-time completion rate
+        // - Cancellation rate
+        // For now, we use a simple formula:
+        // reliability = min(100, base + session_bonus)
+        // where session_bonus increases with more sessions (diminishing returns)
+        let session_bonus = (reputation.total_sessions / 10).min(50); // Max 50 bonus at 500+ sessions
+        reputation.reliability_score = (50 + session_bonus).min(100);
+        
+        // Update timestamp
+        reputation.updated_at = env.ledger().timestamp();
+        
+        // Save to storage
+        let key = DataKey::MentorReputation(mentor_id);
+        env.storage().persistent().set(&key, &reputation);
+        
+        // Emit ReputationUpdated event
+        env.events().publish(
+            (Symbol::new(&env, "ReputationUpdated"),),
+            (mentor_id, reputation.total_sessions, reputation.rating_count),
+        );
+        
         Ok(())
     }
 }
