@@ -49,13 +49,13 @@ fn admin_only_updates_are_enforced() {
     client.init(&admin, &treasury, &100);
 
     env.mock_all_auths();
-    client.set_fee_bps(&200);
+    client.set_fee_bps(&admin, &200);
     let auths = env.auths();
     assert_eq!(auths.len(), 1);
     assert_eq!(auths[0].0, admin);
     assert_eq!(client.fee_bps(), 200);
 
-    client.set_treasury(&new_treasury);
+    client.set_treasury(&admin, &new_treasury);
     let auths = env.auths();
     assert_eq!(auths.len(), 1);
     assert_eq!(auths[0].0, admin);
@@ -74,8 +74,8 @@ fn emits_events_for_updates_and_splits() {
     let client = FeeSplitContractClient::new(&env, &contract_id);
     client.init(&admin, &treasury, &150);
 
-    client.set_fee_bps(&250);
-    client.set_treasury(&Address::generate(&env));
+    client.set_fee_bps(&admin, &250);
+    client.set_treasury(&admin, &Address::generate(&env));
     client.split(&10_000);
 
     let events = env.events().all();

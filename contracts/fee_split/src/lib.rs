@@ -38,6 +38,7 @@ pub enum Error {
     NotInitialized = 2,
     InvalidFeeBps = 3,
     NegativeAmount = 4,
+    Unauthorized = 5,
 }
 
 #[contract]
@@ -69,9 +70,13 @@ impl FeeSplitContract {
     }
 
     /// Require authorization from the stored admin address.
-    fn require_admin(env: &Env) {
+    /// Panics with Unauthorized if caller is not admin.
+    fn require_admin(env: &Env, caller: &Address) {
         let admin = Self::read_admin(env);
-        admin.require_auth();
+        if *caller != admin {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
     }
 
     /// Persist fee bps after validating it is within bounds.
@@ -116,21 +121,27 @@ impl FeeSplitContract {
     }
 
     /// Update fee bps (admin only).
-    pub fn set_fee_bps(env: Env, fee_bps: u32) {
-        Self::require_admin(&env);
+    pub fn set_fee_bps(env: Env, caller: Address, fee_bps: u32) {
+        Self::require_admin(&env, &caller);
         Self::write_fee_bps(&env, fee_bps);
         env.events()
             .publish((Symbol::new(&env, "fee_updated"),), FeeUpdated { fee_bps });
     }
 
     /// Update treasury address (admin only).
-    pub fn set_treasury(env: Env, addr: Address) {
-        Self::require_admin(&env);
+    pub fn set_treasury(env: Env, caller: Address, addr: Address) {
+        Self::require_admin(&env, &caller);
         env.storage().instance().set(&DataKey::Treasury, &addr);
         env.events().publish(
             (Symbol::new(&env, "treasury_updated"),),
             TreasuryUpdated { addr },
         );
+    }
+
+    /// Transfer admin role to a new address (admin only).
+    pub fn set_admin(env: Env, caller: Address, new_admin: Address) {
+        Self::require_admin(&env, &caller);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
     }
 
     /// Return split amounts and emit a payout event without transferring funds.
