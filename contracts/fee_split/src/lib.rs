@@ -12,6 +12,7 @@ pub enum DataKey {
     Admin,
     Treasury,
     FeeBps,
+    Lock,
 }
 
 #[contracttype]
@@ -39,6 +40,7 @@ pub enum Error {
     InvalidFeeBps = 3,
     NegativeAmount = 4,
     Unauthorized = 5,
+    Reentrancy = 6,
 }
 
 #[contract]
@@ -77,6 +79,19 @@ impl FeeSplitContract {
             panic_with_error!(env, Error::Unauthorized);
         }
         caller.require_auth();
+    }
+
+    /// Acquire reentrancy lock or panic if already held.
+    fn acquire_lock(env: &Env) {
+        if env.storage().instance().get(&DataKey::Lock).unwrap_or(false) {
+            panic_with_error!(env, Error::Reentrancy);
+        }
+        env.storage().instance().set(&DataKey::Lock, &true);
+    }
+
+    /// Release reentrancy lock.
+    fn release_lock(env: &Env) {
+        env.storage().instance().set(&DataKey::Lock, &false);
     }
 
     /// Persist fee bps after validating it is within bounds.
@@ -166,6 +181,7 @@ impl FeeSplitContract {
         amount: i128,
         booking_id: Option<u64>,
     ) -> (i128, i128) {
+        Self::acquire_lock(&env);
         let (mentor_share, platform_fee) = Self::split_amount(&env, amount);
         let treasury = Self::read_treasury(&env);
         let token_client = token::Client::new(&env, &token);
@@ -182,6 +198,7 @@ impl FeeSplitContract {
                 platform_fee,
             },
         );
+        Self::release_lock(&env);
         (mentor_share, platform_fee)
     }
 
