@@ -1,6 +1,8 @@
 ## SkillSync Contracts 🔗
 *Soroban smart contracts for the SkillSync platform*
 
+![CI](https://github.com/LaGodxy/SkillSync_Contract/workflows/CI/badge.svg)
+
 ## 📌 About
 **SkillSync Contracts** contains the smart contracts that power decentralized mentorship agreements on SkillSync.
 
@@ -13,11 +15,108 @@ These contracts are written using **Soroban** and deployed on the **Stellar netw
 - Platform Fee Management
 - Session Completion Gate
 
-## 🛠 Tech Stack
+## � CI/CD
+
+This project uses GitHub Actions for continuous integration. The CI pipeline runs on every push and pull request to the `main` branch and includes:
+
+- **Code formatting check** (`cargo fmt --all -- --check`)
+- **Linting** (`cargo clippy --all-targets --all-features -- -D warnings`)
+- **Testing** (`cargo test --all --locked`)
+- **Native build** (`cargo build --release --locked`)
+- **WASM build** (`cargo build -p skillsync-core --target wasm32-unknown-unknown --release --locked`)
+
+The CI status is displayed in the badge at the top of this README. Failing formatting, linting, or tests will block merges.
+
+## �🛠 Tech Stack
 
 - Rust
 - Soroban SDK
 - Stellar CLI
+
+## ⚙️ Developer Environment Setup
+
+### Quick Start (Recommended)
+```bash
+# Install all dependencies automatically
+make install-deps
+
+# Verify installation
+make check-deps
+
+# Build the project
+make wasm
+```
+
+### Manual Setup
+
+#### 1. Install Rust Toolchain
+The project uses `rust-toolchain.toml` to pin the stable Rust version and required components:
+
+```bash
+# Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# The project will automatically use the pinned toolchain
+rustup toolchain install stable
+rustup target add wasm32-unknown-unknown
+rustup component add rustfmt clippy
+```
+
+#### 2. Install Soroban CLI
+```bash
+# Install Soroban CLI via cargo
+cargo install soroban-cli
+
+# Verify installation
+soroban --version
+```
+
+#### 3. Verify Setup
+```bash
+# Check all dependencies are installed
+make check-deps
+
+# Test build
+make wasm
+```
+
+### Development Commands
+
+The project includes a Makefile with common development tasks:
+
+```bash
+# Install all dependencies
+make install-deps
+
+# Check if dependencies are installed
+make check-deps
+
+# Build all workspace members
+make build
+
+# Build contract for WASM target
+make wasm
+
+# Run all tests
+make test
+
+# Format code
+make fmt
+
+# Run lints
+make lint
+
+# Clean build artifacts
+make clean
+
+# Show help
+make help
+```
+
+### Prerequisites
+- Rust (automatically managed by rust-toolchain.toml)
+- Soroban CLI (installed via make install-deps)
+- Make (for using the Makefile commands)
 
 ## ⚙️ Setup & Deployment
 
@@ -28,7 +127,29 @@ These contracts are written using **Soroban** and deployed on the **Stellar netw
 
 ### Build Contracts
 ```bash
-stellar contract build
+# Quick build using Makefile (recommended)
+make wasm
+
+# Or use cargo directly
+cargo build -p skillsync-core --target wasm32-unknown-unknown --release
+
+# Build all workspace members
+make build
+
+# Build CLI tools only
+cargo build -p skillsync-tools --release
+```
+
+### Run CLI Tools
+```bash
+# Deploy contract
+cargo run -p skillsync-tools -- deploy --network testnet -- wasm target/wasm32-unknown-unknown/release/skillsync_core.wasm
+
+# Check configuration
+cargo run -p skillsync-tools -- config --validate
+
+# Build contracts via CLI
+cargo run -p skillsync-tools -- build --profile release
 ```
 ### Installation
 * Install rustup
@@ -58,28 +179,33 @@ stellar contract build
 ## Project Structure
 
 ```
-contracts/
-├── session_gate/           # Session completion gate contract
-│   ├── src/
-│   │   └── lib.rs          # SessionGate contract implementation
-│   ├── Cargo.toml          # Contract dependencies
-│   ├── README.md           # Contract documentation
-│   └── .env.example        # Environment configuration template
-├── Cargo.toml              # workspace or contract top-level (if multiple modules)
-├── src/
-│   ├── lib.rs              # main ink! contract entry (SkillSync)
-│   ├── modules/            # modular contract components (separate Rust modules)
-│   │   ├── user.rs
-│   │   ├── escrow.rs
-│   │   ├── reputation.rs
-│   │   └── dispute.rs
-│   └── utils.rs
-├── tests/
-│   └── unit_tests.rs       # Rust unit tests (ink! off-chain tests)
+SkillSync_Contract/
+├── .github/
+│   └── workflows/
+│       └── ci.yml          # GitHub Actions CI configuration
+├── Cargo.toml              # Workspace configuration
+├── rust-toolchain.toml     # Pinned Rust toolchain and targets
+├── Makefile                # Development automation commands
 ├── README.md               # This file
-└── .env.example            # Environment / deployment template (RPC endpoints, accounts)
-
+├── .gitignore              # Git ignore patterns
+├── crates/
+│   ├── contracts/
+│   │   └── core/           # Core Soroban contract library
+│   │       ├── Cargo.toml  # Contract dependencies
+│   │       └── src/
+│   │           └── lib.rs  # Main contract implementation
+│   └── tools/              # CLI utilities
+│       ├── Cargo.toml      # Tools dependencies
+│       └── src/
+│           └── main.rs     # CLI entry point
+└── target/                 # Build artifacts (gitignored)
 ```
+
+## Workspace Layout
+
+This is a Cargo workspace containing:
+- **crates/contracts/core**: Main Soroban smart contract library
+- **crates/tools**: CLI utilities for deployment and configuration management
 
 
 
