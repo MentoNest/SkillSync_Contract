@@ -42,16 +42,12 @@ enum DataKey {
     FeeOnRefunds,
     // Reputation system
     MentorReputation(Address),
+    // Reentrancy guard
+    ReentrancyLock,
+    // Nonce for replay protection
+    Nonce(Address),
 }
-if session.status != SessionStatus::Locked {
-            return Err(Error::InvalidDisputeState);
-        }
 
-        // Update session status to Disputed
-        let now = env.ledger().timestamp();
-        session.status = SessionStatus::Disputed;
-        session.dispute_opened_at = now;
-        session.updated_at = now;
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SessionStatus {
@@ -140,42 +136,9 @@ pub struct Session {
     pub payee_approved: bool,
     pub approved_at: u64,
     // Resolution fields for dispute resolution
-    // pub resolved_at: u64,
-    // pub resolver: Option<Address>,
-    // pub resolution_note: Option<Bytes>,
     pub resolved_at: u64,
     pub resolver: Option<Address>,
     pub resolution_note: Option<Bytes>,
-    pub dispute_opened_at: u64,
-}
-}
-
-/// Mentor reputation and activity metrics
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct MentorReputation {
-    /// Total number of completed sessions
-    pub total_sessions: u32,
-    /// Sum of all ratings received (for calculating average)
-    pub total_rating_sum: u32,
-    /// Number of ratings received
-    pub rating_count: u32,
-    /// Reliability score (0-100): based on on-time completion, dispute rate, etc.
-    pub reliability_score: u32,
-    /// Last updated timestamp
-    pub updated_at: u64,
-}
-
-impl Default for MentorReputation {
-    fn default() -> Self {
-        MentorReputation {
-            total_sessions: 0,
-            total_rating_sum: 0,
-            rating_count: 0,
-            reliability_score: 50, // Start with neutral score
-            updated_at: 0,
-        }
-    }
 }
 
 const VERSION: u32 = 1;
@@ -210,6 +173,7 @@ pub enum Error {
     SessionNotDisputed = 24,     // Session is not in Disputed status
     ResolutionFeeError = 25,     // Error calculating resolution fees
     FeeCalculationOverflow = 26, // Fee calculation overflow/underflow
+    NonceAlreadyUsed = 27,       // Nonce already used for replay protection
     // InvalidRating = 27,          // Rating value is invalid (must be 1-5)
     InvalidRating = 27,          // Rating value is invalid (must be 1-5)
     ReputationOverflow = 28,     // Reputation calculation overflow
@@ -218,6 +182,8 @@ pub enum Error {
     InvalidSessionId = 31,       // Session ID empty or too long
     InvalidNote = 32,            // Note too long
     AmountTooLarge = 33,         // Amount exceeds maximum allowed
+    Reentrancy = 30,             // Reentrant call detected
+    NonceAlreadyUsed = 30,       // Nonce already used for replay protection
 }
 }
 
@@ -502,6 +468,11 @@ impl SkillSyncContract {
         1
     }
 
+    /// Get the current nonce for an address (for replay protection)
+    pub fn nonce(env: Env, addr: Address) -> u64 {
+        get_nonce(&env, &addr)
+    }
+
     pub fn get_dispute_window(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -633,10 +604,22 @@ impl SkillSyncContract {
         amount: i128,
         fee_bps: u32,
     ) -> Result<(), Error> {
+        // Reentrancy guard
+        acquire_lock(&env)?;
+
         // Validate inputs
         validate_session_id(&session_id)?;
         validate_amount(amount)?;
         validate_different_addresses(&payer, &payee)?;
+        if amount <= 0 {
+            release_lock(&env);
+            return Err(Error::InvalidAmount);
+        }
+
+        if payer == payee {
+            release_lock(&env);
+            return Err(Error::InvalidAmount);
+        }
 
         // Get current timestamp and dispute window
         let now = env.ledger().timestamp();
@@ -696,12 +679,13 @@ impl SkillSyncContract {
         let contract_id = env.current_contract_address();
         token_client.transfer(&payer, &contract_id, &total_amount);
 
-        // Emit FundsLocked event with mentor_id (payee), mentee_id (payer), amount, and session_id
+        // Emit FundsLocked event
         env.events().publish(
             (Symbol::new(&env, "FundsLocked"),),
-            (session_id.clone(), payee.clone(), payer.clone(), amount, fee),
+            (session_id, payer, payee, amount, fee),
         );
 
+        release_lock(&env);
         Ok(())
     }
 
@@ -732,7 +716,10 @@ impl SkillSyncContract {
     /// # Events
     ///
     /// Emits `SessionCompleted(session_id, payee, amount, fee)` upon success
-    pub fn complete_session(env: Env, session_id: Vec<u8>, caller: Address) -> Result<(), Error> {
+    pub fn complete_session(env: Env, session_id: Bytes, caller: Address, nonce: u64) -> Result<(), Error> {
+        // Replay protection: ensure nonce hasn't been used
+        use_nonce(&env, &caller, nonce)?;
+
         // Require caller authorization
         caller.require_auth();
 
@@ -791,25 +778,12 @@ impl SkillSyncContract {
         }
 
         // Emit SessionCompleted event
-        // env.events().publish(
-        //     (Symbol::new(&env, "SessionCompleted"),),
-        //     (session_id.clone(), session.payer.clone(), session.payee.clone(), now),
-        // );
-// Emit FundsReleased event
-        env.events().publish(
-            (Symbol::new(&env, "FundsReleased"),),
-            (session_id.clone(), session.payee.clone(), net_amount, now),
-        );
-
-        // Emit SessionCompleted event
         env.events().publish(
             (Symbol::new(&env, "SessionCompleted"),),
-            (session_id.clone(), session.payer.clone(), session.payee.clone(), now),
+            (session_id, session.payee.clone(), net_amount, fee),
         );
-        // Update mentor reputation (payee gets reputation boost)
-        // Pass None for rating - can be added later via separate rating function
-        let _ = Self::update_mentor_reputation(env.clone(), session.payee.clone(), None);
 
+        release_lock(&env);
         Ok(())
     }
 
@@ -843,7 +817,7 @@ impl SkillSyncContract {
     /// # Events
     ///
     /// Emits `SessionApproved(session_id, approver, both_approved)` upon success
-    pub fn approve_session(env: Env, session_id: Vec<u8>, approver: Address) -> Result<(), Error> {
+    pub fn approve_session(env: Env, session_id: Bytes, approver: Address) -> Result<(), Error> {
         // Require approver authorization
         approver.require_auth();
 
@@ -894,76 +868,10 @@ impl SkillSyncContract {
         let key = DataKey::Session(session_id.clone());
         env.storage().persistent().set(&key, &session);
 
-        // Emit SessionApproved event with session_id, mentee_id (payer), mentor_id (payee)
+        // Emit SessionApproved event
         env.events().publish(
             (Symbol::new(&env, "SessionApproved"),),
-            (session_id.clone(), session.payer.clone(), session.payee.clone(), both_approved),
-        );
-
-        Ok(())
-    }
-
-    /// Opens a dispute on an active escrow session.
-    ///
-    /// This function allows either the payer or payee to open a dispute on a session
-    /// that is in Locked status. Once disputed, the session status changes to Disputed
-    /// and settlement actions are frozen until an arbiter/admin resolves the dispute.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The contract environment
-    /// * `session_id` - The unique session identifier
-    /// * `disputer` - The address of the party opening the dispute (must be payer or payee)
-    /// * `reason` - The reason for opening the dispute
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())` if dispute was successfully opened
-    /// - `Err(Error::SessionNotFound)` if session doesn't exist
-    /// - `Err(Error::NotAuthorizedParty)` if disputer is neither payer nor payee
-    /// - `Err(Error::InvalidSessionStatus)` if session is not in Locked status
-    /// - `Err(Error::AlreadyDisputed)` if session is already disputed
-    ///
-    /// # Events
-    ///
-    /// Emits `DisputeOpened(session_id, disputer, reason)` upon success
-    pub fn open_dispute(
-        env: Env,
-        session_id: Vec<u8>,
-        disputer: Address,
-        reason: Vec<u8>,
-    ) -> Result<(), Error> {
-        // Require disputer authorization
-        disputer.require_auth();
-
-        // Retrieve session
-        let mut session =
-            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
-
-        // Validate disputer is either payer or payee
-        if disputer != session.payer && disputer != session.payee {
-            return Err(Error::NotAuthorizedParty);
-        }
-
-        // Validate session status is Locked (only Locked sessions can be disputed)
-        if session.status != SessionStatus::Locked {
-            return Err(Error::InvalidDisputeState);
-        }
-
-        // Update session status to Disputed
-        let now = env.ledger().timestamp();
-        session.status = SessionStatus::Disputed;
-        session.dispute_opened_at = now;
-        session.updated_at = now;
-
-        // Save updated session
-        let key = DataKey::Session(session_id.clone());
-        env.storage().persistent().set(&key, &session);
-
-        // Emit DisputeOpened event
-        env.events().publish(
-            (Symbol::new(&env, "DisputeOpened"),),
-            (session_id, disputer, reason),
+            (session_id, approver, both_approved),
         );
 
         Ok(())
@@ -1203,7 +1111,7 @@ impl SkillSyncContract {
     /// Emits `DisputeResolved { session_id, to_payer, to_payee, fee_total }` upon success
     pub fn resolve_dispute(
         env: Env,
-        session_id: Vec<u8>,
+        session_id: Bytes,
         to_payer: i128,
         to_payee: i128,
         note: Option<Bytes>,
@@ -1452,6 +1360,38 @@ fn read_admin(env: &Env) -> Result<Address, Error> {
         .instance()
         .get(&DataKey::Admin)
         .ok_or(Error::NotInitialized)
+}
+
+/// Reentrancy guard: acquire lock or return error if already locked
+fn acquire_lock(env: &Env) -> Result<(), Error> {
+    if env.storage().instance().get(&DataKey::ReentrancyLock).unwrap_or(false) {
+        return Err(Error::Reentrancy);
+    }
+    env.storage().instance().set(&DataKey::ReentrancyLock, &true);
+    Ok(())
+}
+
+/// Reentrancy guard: release lock
+fn release_lock(env: &Env) {
+    env.storage().instance().set(&DataKey::ReentrancyLock, &false);
+/// Get the current nonce for an address (for replay protection)
+fn get_nonce(env: &Env, addr: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Nonce(addr.clone()))
+        .unwrap_or(0)
+}
+
+/// Consume a nonce for replay protection. Returns error if nonce already used.
+fn use_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), Error> {
+    let current = get_nonce(env, addr);
+    if nonce <= current {
+        return Err(Error::NonceAlreadyUsed);
+    }
+    env.storage()
+        .persistent()
+        .set(&DataKey::Nonce(addr.clone()), &nonce);
+    Ok(())
 }
 
 fn validate_dispute_window(seconds: u64) -> Result<(), Error> {
