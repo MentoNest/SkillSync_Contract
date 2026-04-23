@@ -76,6 +76,14 @@ pub struct DisputeResolvedEvent {
     pub fee: i128,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct InitializedEvent {
+    pub admin: Address,
+    pub treasury: Address,
+    pub fee_bps: u32,
+}
+
 #[contract]
 pub struct CoreContract;
 
@@ -95,6 +103,14 @@ impl CoreContract {
         env.storage()
             .instance()
             .set(&DataKey::NextSessionId, &1_u64);
+
+        let topics = (symbol_short!("init"),);
+        let data = InitializedEvent {
+            admin: admin.clone(),
+            treasury: treasury.clone(),
+            fee_bps,
+        };
+        env.events().publish(topics, data);
     }
 
     pub fn create_session(
@@ -104,6 +120,7 @@ impl CoreContract {
         token: Address,
         amount: i128,
     ) -> u64 {
+        Self::require_initialized(&env);
         buyer.require_auth();
 
         if amount <= 0 {
@@ -137,6 +154,7 @@ impl CoreContract {
     }
 
     pub fn complete_session(env: Env, session_id: u64) {
+        Self::require_initialized(&env);
         let mut session = Self::get_session(env.clone(), session_id);
         session.seller.require_auth();
 
@@ -155,6 +173,7 @@ impl CoreContract {
     }
 
     pub fn approve_session(env: Env, session_id: u64) {
+        Self::require_initialized(&env);
         let mut session = Self::get_session(env.clone(), session_id);
         session.buyer.require_auth();
 
@@ -202,6 +221,7 @@ impl CoreContract {
     }
 
     pub fn refund_session(env: Env, session_id: u64) {
+        Self::require_initialized(&env);
         let mut session = Self::get_session(env.clone(), session_id);
         session.buyer.require_auth();
 
@@ -252,6 +272,7 @@ impl CoreContract {
     }
 
     pub fn resolve_dispute(env: Env, session_id: u64, buyer_refund: i128) {
+        Self::require_initialized(&env);
         let mut session = Self::get_session(env.clone(), session_id);
         Self::admin(env.clone()).require_auth();
 
@@ -307,6 +328,7 @@ impl CoreContract {
     }
 
     pub fn get_session(env: Env, session_id: u64) -> Session {
+        Self::require_initialized(&env);
         env.storage()
             .persistent()
             .get(&DataKey::Session(session_id))
@@ -351,6 +373,12 @@ impl CoreContract {
     pub fn set_treasury(env: Env, treasury: Address) {
         Self::admin(env.clone()).require_auth();
         env.storage().instance().set(&DataKey::Treasury, &treasury);
+    }
+
+    fn require_initialized(env: &Env) {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("contract not initialized");
+        }
     }
 
     fn apply_fee(env: &Env, amount: i128) -> (i128, i128) {

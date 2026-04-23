@@ -196,3 +196,82 @@ fn resolve_dispute_zero_buyer_refund() {
     assert_eq!(token_client.balance(&treasury), 50);
     assert_eq!(token_client.balance(&contract_id), 0);
 }
+
+#[test]
+fn initialize_sets_admin_treasury_and_fee_bps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, CoreContract);
+    let contract = CoreContractClient::new(&env, &contract_id);
+    contract.initialize(&admin, &treasury, &500);
+
+    assert_eq!(contract.admin(), admin);
+    assert_eq!(contract.treasury(), treasury);
+    assert_eq!(contract.fee_bps(), 500);
+}
+
+#[test]
+#[should_panic(expected = "contract already initialized")]
+fn initialize_twice_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, CoreContract);
+    let contract = CoreContractClient::new(&env, &contract_id);
+    contract.initialize(&admin, &treasury, &500);
+    contract.initialize(&admin, &treasury, &500);
+}
+
+#[test]
+fn initialize_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, CoreContract);
+    let contract = CoreContractClient::new(&env, &contract_id);
+    contract.initialize(&admin, &treasury, &500);
+
+    let events = env.events().all();
+    let init_event = events.iter().find(|e| {
+        std::format!("{:?}", e.1).contains("init")
+    }).unwrap();
+    assert_eq!(init_event.0, contract_id);
+}
+
+#[test]
+#[should_panic(expected = "contract not initialized")]
+fn uninitialized_create_session_reverts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, CoreContract);
+    let contract = CoreContractClient::new(&env, &contract_id);
+    contract.create_session(&buyer, &seller, &buyer, &100);
+}
+
+#[test]
+#[should_panic(expected = "contract not initialized")]
+fn uninitialized_get_session_reverts() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, CoreContract);
+    let contract = CoreContractClient::new(&env, &contract_id);
+    contract.get_session(&1);
+}
+
+#[test]
+#[should_panic(expected = "contract not initialized")]
+fn uninitialized_admin_reverts() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, CoreContract);
+    let contract = CoreContractClient::new(&env, &contract_id);
+    contract.admin();
+}
