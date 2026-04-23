@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
-    Env, Map, Symbol, Vec,
+    Env, Symbol, Vec,
 };
 
 pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
@@ -417,7 +417,7 @@ impl SkillSyncContract {
             .checked_div(10000)
             .ok_or(Error::FeeCalculationOverflow)?;
         
-        let total_available = session.amount.checked_add(fee).ok_or(Error::FeeCalculationOverflow)?;
+        let _total_available = session.amount.checked_add(fee).ok_or(Error::FeeCalculationOverflow)?;
 
         // The resolution split (to_payer + to_payee) should sum to the original 'amount'.
         // The 'fee' is transferred to the treasury as compensation for platform services.
@@ -494,7 +494,7 @@ impl SkillSyncContract {
     fn remove_from_expiry_index(env: Env, session_id: Bytes, expires_at: u64) -> Result<(), Error> {
         let day_bucket = expires_at / SECONDS_PER_DAY;
         let key = DataKey::ExpiryIndex(day_bucket);
-        if let Some(mut session_ids) = env.storage().persistent().get::<_, Vec<Bytes>>(&key) {
+        if let Some(session_ids) = env.storage().persistent().get::<_, Vec<Bytes>>(&key) {
             let mut new_ids = Vec::new(&env);
             for i in 0..session_ids.len() {
                 let id = session_ids.get(i).unwrap();
