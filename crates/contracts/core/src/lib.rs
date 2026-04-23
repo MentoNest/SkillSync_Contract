@@ -1,5 +1,9 @@
 #![no_std]
 
+pub mod error_codes;
+
+pub use error_codes::{AuthError, FinancialError, InitError, SessionError};
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     Env, Symbol, Vec,
