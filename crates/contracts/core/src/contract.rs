@@ -1,24 +1,31 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal, Val,
+    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal, Val,
 };
 
 #[derive(Clone)]
 #[contracttype]
 pub enum SessionStatus {
-    Pending,
+    Locked, // Initial state, funds are held in escrow
     Completed,
     Approved,
+    Refunded,
+    Disputed,
+    Resolved,
+    // Pending, // Removed as Locked is the new initial state
 }
 
 #[derive(Clone)]
 #[contracttype]
 pub struct Session {
-    pub id: u64,
+    pub id: BytesN<32>,
     pub buyer: Address,
     pub seller: Address,
     pub token: Address,
     pub amount: i128,
     pub status: SessionStatus,
+    pub created_at: u64,
+    pub completed_at: Option<u64>, // Use Option for nullable timestamps
+    pub dispute_resolved_at: Option<u64>, // Use Option for nullable timestamps
 }
 
 #[derive(Clone)]
@@ -27,13 +34,13 @@ enum DataKey {
     Treasury,
     FeeBps,
     NextSessionId,
-    Session(u64),
+    Session(BytesN<32>),
 }
 
 #[derive(Clone)]
 #[contracttype]
 pub struct SessionApprovedEvent {
-    pub session_id: u64,
+    pub session_id: BytesN<32>,
     pub buyer: Address,
     pub seller: Address,
     pub token: Address,
@@ -44,7 +51,7 @@ pub struct SessionApprovedEvent {
 #[derive(Clone)]
 #[contracttype]
 pub struct SessionCompletedEvent {
-    pub session_id: u64,
+    pub session_id: BytesN<32>,
 }
 
 #[contract]
@@ -73,7 +80,7 @@ impl CoreContract {
         seller: Address,
         token: Address,
         amount: i128,
-    ) -> u64 {
+    ) -> BytesN<32> {
         buyer.require_auth();
 
         if amount <= 0 {
@@ -83,49 +90,52 @@ impl CoreContract {
             panic!("buyer and seller must differ");
         }
 
-        let session_id = Self::next_session_id(&env);
+        // Generate a Bytes32 ID from the incremental counter
+        let next_id = Self::next_session_id_val(&env);
+        let mut id_bytes = [0u8; 32];
+        id_bytes[24..32].copy_from_slice(&next_id.to_be_bytes());
+        let session_id = BytesN::from_array(&env, &id_bytes);
+
         let session = Session {
-            id: session_id,
-            buyer: buyer.clone(),
+            id: session_id.clone(),
+            buyer,
             seller,
-            token: token.clone(),
+            token,
             amount,
-            status: SessionStatus::Pending,
+            status: SessionStatus::Locked,
+            created_at: env.ledger().timestamp(),
+            completed_at: None,
+            dispute_resolved_at: None,
         };
 
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&buyer, &env.current_contract_address(), &amount);
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Session(session_id), &session);
+        Self::save_session(&env, session_id.clone(), &session);
         env.storage()
             .instance()
-            .set(&DataKey::NextSessionId, &(session_id + 1));
+            .set(&DataKey::NextSessionId, &(next_id + 1));
 
         session_id
     }
 
-    pub fn complete_session(env: Env, session_id: u64) {
-        let mut session = Self::get_session(env.clone(), session_id);
+    pub fn complete_session(env: Env, session_id: BytesN<32>) {
+        let mut session = Self::get_session(env.clone(), session_id.clone());
         session.seller.require_auth();
 
-        if !matches!(session.status, SessionStatus::Pending) {
-            panic!("session must be pending");
+        if !matches!(session.status, SessionStatus::Locked) {
+            panic!("session must be locked to be completed");
         }
-
         session.status = SessionStatus::Completed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Session(session_id), &session);
+        session.completed_at = Some(env.ledger().timestamp());
+        Self::save_session(&env, &session_id, &session);
 
-        let topics = (symbol_short!("completed"), session_id);
-        let data = SessionCompletedEvent { session_id };
+        let topics = (symbol_short!("completed"), session_id.clone());
+        let data = SessionCompletedEvent { session_id: session_id.clone() };
         env.events().publish(topics, data);
     }
 
-    pub fn approve_session(env: Env, session_id: u64) {
-        let mut session = Self::get_session(env.clone(), session_id);
+    pub fn approve_session(env: Env, session_id: BytesN<32>) {
+        let mut session = Self::get_session(env.clone(), session_id.clone());
         session.buyer.require_auth();
 
         if !matches!(session.status, SessionStatus::Completed) {
@@ -147,13 +157,11 @@ impl CoreContract {
         }
 
         session.status = SessionStatus::Approved;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Session(session_id), &session);
+        Self::save_session(&env, &session_id, &session);
 
-        let topics = (symbol_short!("approved"), session_id);
+        let topics = (symbol_short!("approved"), session_id.clone());
         let data: Val = SessionApprovedEvent {
-            session_id,
+            session_id: session_id.clone(),
             buyer: session.buyer,
             seller: session.seller,
             token: session.token,
@@ -164,11 +172,15 @@ impl CoreContract {
         env.events().publish(topics, data);
     }
 
-    pub fn get_session(env: Env, session_id: u64) -> Session {
+    pub fn get_session(env: Env, session_id: BytesN<32>) -> Session {
         env.storage()
             .persistent()
             .get(&DataKey::Session(session_id))
-            .unwrap_or_else(|| panic!("session not found"))
+            .unwrap_or_else(|| panic!("Session not found"))
+    }
+
+    fn save_session(env: &Env, id: &BytesN<32>, session: &Session) {
+        env.storage().persistent().set(&DataKey::Session(id.clone()), session);
     }
 
     pub fn treasury(env: Env) -> Address {
@@ -185,7 +197,7 @@ impl CoreContract {
             .unwrap_or_else(|| panic!("contract not initialized"))
     }
 
-    fn next_session_id(env: &Env) -> u64 {
+    fn next_session_id_val(env: &Env) -> u64 {
         env.storage()
             .instance()
             .get(&DataKey::NextSessionId)
