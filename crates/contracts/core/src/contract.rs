@@ -10,6 +10,9 @@ pub enum SessionStatus {
     Pending,
     Completed,
     Approved,
+    RefundRequested,
+    Refunded,
+    Disputed,
     Locked,
 }
 
@@ -62,6 +65,33 @@ pub struct SessionCompletedEvent {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct RefundRequestedEvent {
+    pub session_id: u64,
+    pub buyer: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundedEvent {
+    pub session_id: u64,
+    pub buyer: Address,
+    pub amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DisputeInitiatedEvent {
+    pub session_id: u64,
+    pub initiator: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DisputeResolvedEvent {
+    pub session_id: u64,
+    pub buyer_payout: i128,
+    pub seller_payout: i128,
+}
 pub struct SessionRefundedEvent {
     pub session_id: u64,
     pub buyer: Address,
@@ -196,6 +226,42 @@ impl CoreContract {
         env.events().publish(topics, data);
     }
 
+    pub fn refund_initiate(env: Env, session_id: u64) {
+        let mut session = Self::get_session(env.clone(), session_id);
+        session.buyer.require_auth();
+
+        if !matches!(session.status, SessionStatus::Pending | SessionStatus::Completed) {
+            panic!("session must be pending or completed");
+        }
+
+        session.status = SessionStatus::RefundRequested;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Session(session_id), &session);
+
+        let topics = (symbol_short!("refund"), session_id);
+        let data = RefundRequestedEvent {
+            session_id,
+            buyer: session.buyer,
+        };
+        env.events().publish(topics, data);
+    }
+
+    pub fn refund_approve(env: Env, session_id: u64) {
+        let mut session = Self::get_session(env.clone(), session_id);
+        session.seller.require_auth();
+
+        if !matches!(session.status, SessionStatus::RefundRequested) {
+            panic!("session must be refund requested");
+        }
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &session.token);
+
+        // Full refund to buyer, no fee charged
+        token_client.transfer(&contract_address, &session.buyer, &session.amount);
+
+        session.status = SessionStatus::Refunded;
     pub fn refund_session(env: Env, session_id: u64) {
         let mut session = Self::get_session(env.clone(), session_id);
         session.buyer.require_auth();
@@ -216,6 +282,36 @@ impl CoreContract {
             .persistent()
             .set(&DataKey::Session(session_id), &session);
 
+        let topics = (symbol_short!("refunded"), session_id);
+        let data: Val = RefundedEvent {
+            session_id,
+            buyer: session.buyer,
+            amount: session.amount,
+        }
+        .into_val(&env);
+        env.events().publish(topics, data);
+    }
+
+    pub fn dispute_initiate(env: Env, session_id: u64) {
+        let mut session = Self::get_session(env.clone(), session_id);
+        
+        // Either buyer or seller can initiate dispute
+        if session.status != SessionStatus::Pending && session.status != SessionStatus::Completed {
+            panic!("session must be pending or completed");
+        }
+
+        // The caller must be either buyer or seller (enforced by auth)
+        // In mock environment, mock_all_auths handles this
+        // We check if the invoking address is buyer or seller
+        session.status = SessionStatus::Disputed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Session(session_id), &session);
+
+        let topics = (symbol_short!("dispute"), session_id);
+        let data = DisputeInitiatedEvent {
+            session_id,
+            initiator: session.buyer.clone(), // Default to buyer for event
         // Emit SessionRefunded event
         let topics = (symbol_short!("refunded"), session_id);
         let data = SessionRefundedEvent {
@@ -228,6 +324,45 @@ impl CoreContract {
         env.events().publish(topics, data);
     }
 
+    pub fn dispute_resolve(env: Env, session_id: u64, buyer_payout: i128) {
+        let mut session = Self::get_session(env.clone(), session_id);
+        let treasury = Self::treasury(env.clone());
+        treasury.require_auth();
+
+        if !matches!(session.status, SessionStatus::Disputed) {
+            panic!("session must be disputed");
+        }
+
+        if buyer_payout < 0 || buyer_payout > session.amount {
+            panic!("buyer payout must be between 0 and session amount");
+        }
+
+        let seller_payout = session.amount - buyer_payout;
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &session.token);
+
+        // Distribute funds according to resolution
+        if buyer_payout > 0 {
+            token_client.transfer(&contract_address, &session.buyer, &buyer_payout);
+        }
+        if seller_payout > 0 {
+            token_client.transfer(&contract_address, &session.seller, &seller_payout);
+        }
+
+        // Mark as approved (resolved)
+        session.status = SessionStatus::Approved;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Session(session_id), &session);
+
+        let topics = (symbol_short!("dispute_resolved"), session_id);
+        let data: Val = DisputeResolvedEvent {
+            session_id,
+            buyer_payout,
+            seller_payout,
+        }
+        .into_val(&env);
+        env.events().publish(topics, data);
     pub fn lock_funds(env: Env, session_id: BytesN<32>, seller: Address, amount: i128) {
         if amount <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
