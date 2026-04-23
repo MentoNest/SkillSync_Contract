@@ -172,6 +172,76 @@ impl CoreContract {
         env.events().publish(topics, data);
     }
 
+    pub fn refund_session(env: Env, session_id: BytesN<32>) {
+        let mut session = Self::get_session(env.clone(), session_id.clone());
+        // Only the seller or an admin can trigger a refund, or a buyer if it's disputed
+        session.seller.require_auth();
+
+        if !matches!(session.status, SessionStatus::Locked) {
+            panic!("only locked sessions can be refunded");
+        }
+
+        let token_client = token::Client::new(&env, &session.token);
+        token_client.transfer(&env.current_contract_address(), &session.buyer, &session.amount);
+
+        session.status = SessionStatus::Refunded;
+        Self::save_session(&env, &session_id, &session);
+
+        env.events().publish((symbol_short!("refunded"), session_id), ());
+    }
+
+    pub fn dispute_session(env: Env, session_id: BytesN<32>) {
+        let mut session = Self::get_session(env.clone(), session_id.clone());
+        session.buyer.require_auth();
+
+        if !matches!(session.status, SessionStatus::Locked) && !matches!(session.status, SessionStatus::Completed) {
+            panic!("cannot dispute at this stage");
+        }
+
+        session.status = SessionStatus::Disputed;
+        Self::save_session(&env, &session_id, &session);
+
+        env.events().publish((symbol_short!("disputed"), session_id), ());
+    }
+
+    pub fn resolve_dispute(env: Env, session_id: BytesN<32>, refund_buyer: bool) {
+        // Only the treasury/admin can resolve a dispute
+        let treasury = Self::treasury(env.clone());
+        treasury.require_auth();
+
+        let mut session = Self::get_session(env.clone(), session_id.clone());
+
+        if !matches!(session.status, SessionStatus::Disputed) {
+            panic!("session is not disputed");
+        }
+
+        let token_client = token::Client::new(&env, &session.token);
+        let contract_address = env.current_contract_address();
+
+        if refund_buyer {
+            token_client.transfer(&contract_address, &session.buyer, &session.amount);
+            session.status = SessionStatus::Refunded;
+        } else {
+            let fee_bps = Self::fee_bps(env.clone());
+            let fee = session.amount * i128::from(fee_bps) / 10_000;
+            let payout = session.amount - fee;
+
+            if payout > 0 {
+                token_client.transfer(&contract_address, &session.seller, &payout);
+            }
+            if fee > 0 {
+                token_client.transfer(&contract_address, &treasury, &fee);
+            }
+            session.status = SessionStatus::Resolved;
+        }
+
+        session.dispute_resolved_at = Some(env.ledger().timestamp());
+        Self::save_session(&env, &session_id, &session);
+
+        let topics = (symbol_short!("resolved"), session_id);
+        env.events().publish(topics, ());
+    }
+
     pub fn get_session(env: Env, session_id: BytesN<32>) -> Session {
         env.storage()
             .persistent()
