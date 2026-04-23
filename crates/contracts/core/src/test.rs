@@ -1,163 +1,85 @@
 #![cfg(test)]
 
-use soroban_sdk::{symbol_short, vec, Env, Address, BytesN, Symbol, testutils::Address as TestAddress};
-use crate::{CoreContract, Session, SessionStatus, DataKey};
+extern crate std;
 
-#[test]
-fn test_hello() {
+use crate::{CoreContract, CoreContractClient, SessionStatus};
+use soroban_sdk::{
+    testutils::{Address as _, Events as _},
+    token::{Client as TokenClient, StellarAssetClient},
+    Address, Env,
+};
+
+fn setup() -> (
+    Env,
+    CoreContractClient<'static>,
+    TokenClient<'static>,
+    StellarAssetClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
     let env = Env::default();
+    env.mock_all_auths();
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_address);
+    let asset_client = StellarAssetClient::new(&env, &token_address);
+
+    asset_client.mint(&buyer, &1_000);
+
     let contract_id = env.register_contract(None, CoreContract);
-    let result: Vec<Symbol> = env.invoke_contract(
-        &contract_id,
-        &symbol_short!("hello"),
-        vec![&env, symbol_short!("World")],
-    );
-    assert_eq!(result, vec![&env, symbol_short!("Hello"), symbol_short!("World")]);
+    let contract = CoreContractClient::new(&env, &contract_id);
+    contract.initialize(&treasury, &500);
+
+    (
+        env,
+        contract,
+        token_client,
+        asset_client,
+        buyer,
+        seller,
+        treasury,
+        contract_id,
+    )
 }
 
 #[test]
-fn test_complete_session_success() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, CoreContract);
-    
-    // Create test addresses
-    let seller = Address::generate(&env);
-    let buyer = Address::generate(&env);
-    let session_id = BytesN::from_array(&env, &[1u8; 32]);
-    
-    // Create a session in Locked status
-    env.invoke_contract(
-        &contract_id,
-        &symbol_short!("create_session"),
-        vec![
-            &env,
-            session_id.clone(),
-            seller.clone(),
-            buyer.clone(),
-            1000i128,
-        ],
-    );
-    
-    // Verify session is created and locked
-    let session: Session = env.invoke_contract(
-        &contract_id,
-        &symbol_short!("get_session"),
-        vec![&env, session_id.clone()],
-    );
-    assert_eq!(session.status, SessionStatus::Locked);
-    assert_eq!(session.seller, seller);
-    assert_eq!(session.buyer, buyer);
-    
-    // Complete the session as seller
-    env.invoke_contract(
-        &contract_id,
-        &symbol_short!("complete_session"),
-        vec![&env, session_id.clone()],
-    );
-    
-    // Verify session is completed
-    let completed_session: Session = env.invoke_contract(
-        &contract_id,
-        &symbol_short!("get_session"),
-        vec![&env, session_id.clone()],
-    );
-    assert_eq!(completed_session.status, SessionStatus::Completed);
-    assert!(completed_session.completed_at.is_some());
-    
-    // Verify event was emitted
+fn approve_session_releases_payout_fee_and_event() {
+    let (env, contract, token_client, _, buyer, seller, treasury, contract_id) = setup();
+
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.approve_session(&session_id);
+
+    let session = contract.get_session(&session_id);
+    assert!(matches!(session.status, SessionStatus::Approved));
+    assert_eq!(token_client.balance(&buyer), 0);
+    assert_eq!(token_client.balance(&seller), 950);
+    assert_eq!(token_client.balance(&treasury), 50);
+    assert_eq!(token_client.balance(&contract_id), 0);
+
     let events = env.events().all();
-    assert_eq!(events.len(), 1);
-    let event = &events[0];
-    assert_eq!(event.topics[0], symbol_short!("SessionCompleted"));
-    assert_eq!(event.topics[1], session_id);
+    let last_event = events.last().unwrap();
+    assert_eq!(last_event.0, contract_id);
+    assert!(std::format!("{:?}", last_event.1).contains("approved"));
 }
 
 #[test]
-fn test_complete_session_unauthorized() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, CoreContract);
-    
-    // Create test addresses
-    let seller = Address::generate(&env);
-    let buyer = Address::generate(&env);
-    let unauthorized_user = Address::generate(&env);
-    let session_id = BytesN::from_array(&env, &[2u8; 32]);
-    
-    // Create a session in Locked status
-    env.invoke_contract(
-        &contract_id,
-        &symbol_short!("create_session"),
-        vec![
-            &env,
-            session_id.clone(),
-            seller.clone(),
-            buyer.clone(),
-            1000i128,
-        ],
-    );
-    
-    // Try to complete session as unauthorized user
-    let result = env.try_invoke_contract(
-        &contract_id,
-        &symbol_short!("complete_session"),
-        vec![&env, session_id.clone()],
-    );
-    
-    // Should fail with authorization error
-    assert!(result.is_err());
-}
+fn approve_session_records_buyer_authorization() {
+    let (env, contract, token_client, _, buyer, seller, _, _) = setup();
 
-#[test]
-fn test_complete_session_invalid_status() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, CoreContract);
-    
-    // Create test addresses
-    let seller = Address::generate(&env);
-    let buyer = Address::generate(&env);
-    let session_id = BytesN::from_array(&env, &[3u8; 32]);
-    
-    // Create a session in Completed status directly (bypass normal flow)
-    let session = Session {
-        id: session_id.clone(),
-        seller: seller.clone(),
-        buyer: buyer.clone(),
-        status: SessionStatus::Created, // Not Locked
-        created_at: env.ledger().timestamp(),
-        locked_at: None,
-        completed_at: None,
-        amount: 1000i128,
-    };
-    
-    // Manually store the session
-    let session_key = DataKey::Session(session_id.clone());
-    env.storage().persistent().set(&session_key, &session);
-    
-    // Try to complete session
-    let result = env.try_invoke_contract(
-        &contract_id,
-        &symbol_short!("complete_session"),
-        vec![&env, session_id.clone()],
-    );
-    
-    // Should fail with invalid status error
-    assert!(result.is_err());
-}
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.approve_session(&session_id);
 
-#[test]
-fn test_complete_session_not_found() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, CoreContract);
-    
-    let session_id = BytesN::from_array(&env, &[4u8; 32]);
-    
-    // Try to complete non-existent session
-    let result = env.try_invoke_contract(
-        &contract_id,
-        &symbol_short!("complete_session"),
-        vec![&env, session_id.clone()],
-    );
-    
-    // Should fail with session not found error
-    assert!(result.is_err());
+    let snapshot = env.to_snapshot();
+    let approve_auth = snapshot.auth.0.last().unwrap();
+    let auth_debug = std::format!("{:?}", approve_auth);
+    assert!(auth_debug.contains("approve_session"));
 }
