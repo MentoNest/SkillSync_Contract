@@ -3,6 +3,11 @@
 pub mod error_codes;
 
 pub use error_codes::{AuthError, FinancialError, InitError, SessionError};
+pub mod errors;
+pub mod events;
+
+pub use errors::ContractError;
+pub use events::{ContractUpgraded, DisputeResolved, TreasuryUpdated};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
@@ -114,6 +119,54 @@ pub struct Session {
     pub resolution_note: Option<Bytes>,
 }
 
+// ── Event structs ────────────────────────────────────────────────────────────
+
+/// Emitted when a buyer successfully refunds a session (manual or auto).
+/// Closes issue #147.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SessionRefundedEvent {
+    pub session_id: Bytes,
+    pub buyer: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+/// Emitted when a session is auto-refunded after the dispute window expires.
+/// Closes issue #148.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AutoRefundExecutedEvent {
+    pub session_id: Bytes,
+    pub buyer: Address,
+    pub amount: i128,
+    pub completed_at: u64,
+    pub refunded_at: u64,
+}
+
+/// Emitted when a dispute is opened on a session.
+/// Closes issue #149.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DisputeOpenedEvent {
+    pub session_id: Bytes,
+    pub opened_by: Address,
+    pub reason: Bytes,
+    pub timestamp: u64,
+}
+
+/// Emitted when the admin updates the platform fee.
+/// Closes issue #151.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PlatformFeeUpdatedEvent {
+    pub old_fee_bps: u32,
+    pub new_fee_bps: u32,
+    pub updated_by: Address,
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+
 const VERSION: u32 = 1;
 
 #[contracterror]
@@ -194,6 +247,36 @@ impl SkillSyncContract {
                 dispute_window_secs,
                 VERSION,
             ),
+        );
+
+        Ok(())
+    }
+
+    /// Update the platform fee. Only callable by admin.
+    /// Emits PlatformFeeUpdatedEvent (closes issue #151).
+    pub fn set_platform_fee(env: Env, new_fee_bps: u32) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        validate_platform_fee_bps(new_fee_bps)?;
+
+        let old_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFee)
+            .unwrap_or(0);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformFee, &new_fee_bps);
+
+        env.events().publish(
+            (Symbol::new(&env, "PlatformFeeUpdated"),),
+            PlatformFeeUpdatedEvent {
+                old_fee_bps,
+                new_fee_bps,
+                updated_by: admin,
+            },
         );
 
         Ok(())
@@ -296,9 +379,7 @@ impl SkillSyncContract {
         }
 
         let now = env.ledger().timestamp();
-        
-        // In the new implementation, complete_session just marks it as Completed.
-        // Finalization (releasing funds) should happen after the dispute window.
+
         session.status = SessionStatus::Completed;
         session.updated_at = now;
 
@@ -313,6 +394,9 @@ impl SkillSyncContract {
         Ok(())
     }
 
+    /// Auto-refund a session after the dispute window has elapsed.
+    /// Emits AutoRefundExecutedEvent (closes issue #148) and
+    /// SessionRefundedEvent (closes issue #147).
     pub fn auto_refund(env: Env, session_id: Bytes) -> Result<(), Error> {
         let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
@@ -327,56 +411,71 @@ impl SkillSyncContract {
             return Err(Error::DisputeWindowNotElapsed);
         }
 
-        // Refund full amount to buyer (payer) - No fee deducted
         let token_client = token::Client::new(&env, &session.asset);
         let contract_id = env.current_contract_address();
-        
-        // The total amount locked was amount + fee
+
         let fee = session.amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
             .ok_or(Error::FeeCalculationOverflow)?;
-        
+
         let total_locked = session.amount.checked_add(fee).ok_or(Error::FeeCalculationOverflow)?;
 
         token_client.transfer(&contract_id, &session.payer, &total_locked);
 
+        let completed_at = session.updated_at;
         session.status = SessionStatus::Refunded;
         session.updated_at = now;
 
         let key = DataKey::Session(session_id.clone());
         env.storage().persistent().set(&key, &session);
 
-        // Remove from expiry index
         Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
 
+        // Emit AutoRefundExecuted event (issue #148)
         env.events().publish(
             (Symbol::new(&env, "AutoRefundExecuted"),),
-            (session_id, session.payer, total_locked),
+            AutoRefundExecutedEvent {
+                session_id: session_id.clone(),
+                buyer: session.payer.clone(),
+                amount: total_locked,
+                completed_at,
+                refunded_at: now,
+            },
+        );
+
+        // Emit SessionRefunded event (issue #147)
+        env.events().publish(
+            (Symbol::new(&env, "SessionRefunded"),),
+            SessionRefundedEvent {
+                session_id,
+                buyer: session.payer,
+                amount: total_locked,
+                timestamp: now,
+            },
         );
 
         Ok(())
     }
 
+    /// Open a dispute on a session.
+    /// Emits DisputeOpenedEvent (closes issue #149).
     pub fn open_dispute(env: Env, session_id: Bytes, caller: Address, reason: Bytes) -> Result<(), Error> {
         caller.require_auth();
 
         let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
-        // Authorization check: only payer or payee can open a dispute
         if caller != session.payer && caller != session.payee {
             return Err(Error::Unauthorized);
         }
 
-        // Status check: must be Locked or Completed
         if session.status != SessionStatus::Locked && session.status != SessionStatus::Completed {
             return Err(Error::InvalidSessionStatus);
         }
 
         let now = env.ledger().timestamp();
-        
-        // Update session
+
         session.status = SessionStatus::Disputed;
         session.updated_at = now;
         session.dispute_opened_at = now;
@@ -384,10 +483,15 @@ impl SkillSyncContract {
         let key = DataKey::Session(session_id.clone());
         env.storage().persistent().set(&key, &session);
 
-        // Emit DisputeOpened event
+        // Emit DisputeOpened event (issue #149)
         env.events().publish(
             (Symbol::new(&env, "DisputeOpened"),),
-            (session_id, caller, reason),
+            DisputeOpenedEvent {
+                session_id,
+                opened_by: caller,
+                reason,
+                timestamp: now,
+            },
         );
 
         Ok(())
@@ -400,31 +504,25 @@ impl SkillSyncContract {
         to_payee: i128,
         note: Option<Bytes>,
     ) -> Result<(), Error> {
-        // Validate note length
         validate_note(&note)?;
 
-        // Require admin authorization
         let admin = read_admin(&env)?;
         admin.require_auth();
 
         let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
-        // Validate session status is Disputed
         if session.status != SessionStatus::Disputed {
             return Err(Error::SessionNotDisputed);
         }
 
-        // Calculate total locked amount (amount + fee)
         let fee = session.amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
             .ok_or(Error::FeeCalculationOverflow)?;
-        
+
         let _total_available = session.amount.checked_add(fee).ok_or(Error::FeeCalculationOverflow)?;
 
-        // The resolution split (to_payer + to_payee) should sum to the original 'amount'.
-        // The 'fee' is transferred to the treasury as compensation for platform services.
         if to_payer + to_payee != session.amount {
             return Err(Error::InvalidResolutionAmount);
         }
@@ -437,7 +535,6 @@ impl SkillSyncContract {
         let token_client = token::Client::new(&env, &session.asset);
         let contract_id = env.current_contract_address();
 
-        // Perform transfers
         if to_payer > 0 {
             token_client.transfer(&contract_id, &session.payer, &to_payer);
         }
@@ -458,10 +555,8 @@ impl SkillSyncContract {
         let key = DataKey::Session(session_id.clone());
         env.storage().persistent().set(&key, &session);
 
-        // Remove from expiry index
         Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
 
-        // Emit DisputeResolved event
         env.events().publish(
             (Symbol::new(&env, "DisputeResolved"),),
             (session_id, to_payer, to_payee, fee),
@@ -585,143 +680,3 @@ fn validate_note(note: &Option<Bytes>) -> Result<(), Error> {
     }
     Ok(())
 }
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec};
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    WasmHash,
-}
-mod contract;
-
-pub use contract::{
-    AutoRefundExecutedEvent, CoreContract, CoreContractClient, Session, SessionApprovedEvent,
-    SessionCompletedEvent, SessionStatus,
-
-    ContractError, CoreContract, CoreContractClient, LockedSession, Session,
-    SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
-
-    CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
-    SessionStatus, RefundRequestedEvent, RefundedEvent, DisputeInitiatedEvent,
-    DisputeResolvedEvent,
-    SessionRefundedEvent, SessionStatus,
-};
-
-#[contractimpl]
-impl CoreContract {
-    pub fn init(env: Env, admin: Address) {
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &admin);
-    }
-
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        let old_wasm_hash: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&DataKey::WasmHash)
-            .unwrap_or(BytesN::from_array(&env, &[0; 32]));
-
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
-        env.storage().instance().set(&DataKey::WasmHash, &new_wasm_hash);
-        
-        env.events().publish(
-            (Symbol::new(&env, "ContractUpgraded"),),
-            (old_wasm_hash, new_wasm_hash),
-        );
-    }
-
-    pub fn hello(env: Env, to: Symbol) -> Vec<Symbol> {
-        let mut vec = Vec::new(&env);
-        vec.push_back(symbol_short!("Hello"));
-        vec.push_back(to);
-        vec
-    }
-}
-#[cfg(test)]
-mod test;
-
-#![no_std]
-
-mod contract;
-
-pub use contract::{
-<<<<<<< HEAD
-    CoreContract, CoreContractClient, DisputeResolvedEvent, FeeDeductedEvent, InitializedEvent,
-    RefundEvent, Session, SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
-=======
-    CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
-    SessionRefundedEvent, SessionStatus,
->>>>>>> 8ce83833b5b26cd2b768923ee338582d4cb4fd51
-};
-
-#[cfg(test)]
-mod test;
-
-
-fn refund() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, CoreContract);
-    let result: Vec<Symbol> = env.invoke_contract(
-        &contract_id,
-        &symbol_short!("hello"),
-        vec![&env, symbol_short!("World")],
-    );
-    assert_eq!(result, vec![&env, symbol_short!("Hello"), symbol_short!("World")]);
-
-    
-#[contractimpl]
-impl CoreContract {
-    pub fn hello(env: Env, to: Symbol) -> Vec<Symbol> {
-        vec![&env, symbol_short!("Refund"), to]
-    }
-}
-}
-
-
-
-fn setup() -> (
-    Env,
-    CoreContractClient<'static>,
-    TokenClient<'static>,
-    StellarAssetClient<'static>,
-    Address,
-    Address,
-    Address,
-    Address,
-) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = TokenClient::new(&env, &token_address);
-    let asset_client = StellarAssetClient::new(&env, &token_address);
-
-    asset_client.mint(&buyer, &1_000);
-
-    let contract_id = env.register_contract(None, CoreContract);
-    let contract = CoreContractClient::new(&env, &contract_id);
-    contract.initialize(&treasury, &500);
-
-    (
-        env,
-        contract,
-        token_client,
-        asset_client,
-        buyer,
-        seller,
-        treasury,
-        contract_id,
-    )
-}
-
-
-
