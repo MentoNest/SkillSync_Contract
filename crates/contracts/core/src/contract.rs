@@ -29,7 +29,6 @@ enum DataKey {
     Admin,
     Treasury,
     FeeBps,
-    NextSessionId,
     Session(u64),
 }
 
@@ -84,6 +83,16 @@ pub struct InitializedEvent {
     pub fee_bps: u32,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct FundsLockedEvent {
+    pub session_id: u64,
+    pub buyer: Address,
+    pub seller: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
 #[contract]
 pub struct CoreContract;
 
@@ -100,9 +109,6 @@ impl CoreContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextSessionId, &1_u64);
 
         let topics = (symbol_short!("init"),);
         let data = InitializedEvent {
@@ -113,16 +119,20 @@ impl CoreContract {
         env.events().publish(topics, data);
     }
 
-    pub fn create_session(
+    pub fn lock_funds(
         env: Env,
+        session_id: u64,
         buyer: Address,
         seller: Address,
         token: Address,
         amount: i128,
-    ) -> u64 {
+    ) {
         Self::require_initialized(&env);
         buyer.require_auth();
 
+        if env.storage().persistent().has(&DataKey::Session(session_id)) {
+            panic!("session already exists");
+        }
         if amount <= 0 {
             panic!("amount must be positive");
         }
@@ -130,11 +140,10 @@ impl CoreContract {
             panic!("buyer and seller must differ");
         }
 
-        let session_id = Self::next_session_id(&env);
         let session = Session {
             id: session_id,
             buyer: buyer.clone(),
-            seller,
+            seller: seller.clone(),
             token: token.clone(),
             amount,
             status: SessionStatus::Pending,
@@ -146,11 +155,16 @@ impl CoreContract {
         env.storage()
             .persistent()
             .set(&DataKey::Session(session_id), &session);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextSessionId, &(session_id + 1));
 
-        session_id
+        let topics = (symbol_short!("locked"), session_id);
+        let data = FundsLockedEvent {
+            session_id,
+            buyer,
+            seller,
+            token,
+            amount,
+        };
+        env.events().publish(topics, data);
     }
 
     pub fn complete_session(env: Env, session_id: u64) {
@@ -389,12 +403,5 @@ impl CoreContract {
             / 10_000;
         let after_fee = amount - fee;
         (after_fee, fee)
-    }
-
-    fn next_session_id(env: &Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::NextSessionId)
-            .unwrap_or_else(|| panic!("contract not initialized"))
     }
 }
