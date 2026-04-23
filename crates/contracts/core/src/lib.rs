@@ -680,3 +680,138 @@ fn validate_note(note: &Option<Bytes>) -> Result<(), Error> {
     }
     Ok(())
 }
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec};
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    WasmHash,
+}
+mod contract;
+
+pub use contract::{
+    AutoRefundExecutedEvent, CoreContract, CoreContractClient, FundsLockedEvent, InitializedEvent,
+    Session, SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
+
+    ContractError, CoreContract, CoreContractClient, LockedSession, Session,
+    SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
+
+    CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
+    SessionStatus, RefundRequestedEvent, RefundedEvent, DisputeInitiatedEvent,
+    DisputeResolvedEvent,
+    SessionRefundedEvent, SessionStatus,
+};
+
+#[contractimpl]
+impl CoreContract {
+    pub fn init(env: Env, admin: Address) {
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::WasmHash)
+            .unwrap_or(BytesN::from_array(&env, &[0; 32]));
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.storage().instance().set(&DataKey::WasmHash, &new_wasm_hash);
+        
+        env.events().publish(
+            (Symbol::new(&env, "ContractUpgraded"),),
+            (old_wasm_hash, new_wasm_hash),
+        );
+    }
+
+    pub fn hello(env: Env, to: Symbol) -> Vec<Symbol> {
+        let mut vec = Vec::new(&env);
+        vec.push_back(symbol_short!("Hello"));
+        vec.push_back(to);
+        vec
+    }
+}
+#[cfg(test)]
+mod test;
+
+#![no_std]
+
+mod contract;
+
+pub use contract::{
+    CoreContract, CoreContractClient, DisputeResolvedEvent, FeeDeductedEvent, InitializedEvent,
+    RefundEvent, Session, SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
+    CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
+    SessionRefundedEvent, SessionStatus,
+};
+
+#[cfg(test)]
+mod test;
+
+
+fn refund() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, CoreContract);
+    let result: Vec<Symbol> = env.invoke_contract(
+        &contract_id,
+        &symbol_short!("hello"),
+        vec![&env, symbol_short!("World")],
+    );
+    assert_eq!(result, vec![&env, symbol_short!("Hello"), symbol_short!("World")]);
+
+    
+#[contractimpl]
+impl CoreContract {
+    pub fn hello(env: Env, to: Symbol) -> Vec<Symbol> {
+        vec![&env, symbol_short!("Refund"), to]
+    }
+}
+}
+
+
+
+fn setup() -> (
+    Env,
+    CoreContractClient<'static>,
+    TokenClient<'static>,
+    StellarAssetClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_address);
+    let asset_client = StellarAssetClient::new(&env, &token_address);
+
+    asset_client.mint(&buyer, &1_000);
+
+    let contract_id = env.register_contract(None, CoreContract);
+    let contract = CoreContractClient::new(&env, &contract_id);
+    contract.initialize(&treasury, &500);
+
+    (
+        env,
+        contract,
+        token_client,
+        asset_client,
+        buyer,
+        seller,
+        treasury,
+        contract_id,
+    )
+}
+

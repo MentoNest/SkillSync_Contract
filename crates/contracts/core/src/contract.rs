@@ -2,7 +2,6 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal, Val,
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, Bytes, BytesN, Env, IntoVal, Symbol, Val,
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal, Val,
 };
 
 #[derive(Clone)]
@@ -60,13 +59,33 @@ enum DataKey {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct InitializedEvent {
+    pub admin: Address,
+    pub treasury: Address,
+    pub dispute_window: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct FundsLockedEvent {
+    pub session_id: BytesN<32>,
+    pub buyer: Address,
+    pub seller: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct SessionApprovedEvent {
     pub session_id: BytesN<32>,
     pub buyer: Address,
     pub seller: Address,
     pub token: Address,
+    pub amount: i128,
     pub payout: i128,
     pub fee: i128,
+    pub timestamp: u64,
 }
 
 #[derive(Clone)]
@@ -142,9 +161,20 @@ impl CoreContract {
             .instance()
             .set(&DataKey::NextSessionId, &1_u64);
         // Default dispute window: 7 days (604800 seconds)
+        let dispute_window_secs: u64 = 604800;
         env.storage()
             .instance()
-            .set(&DataKey::DisputeWindowSecs, &604800_u64);
+            .set(&DataKey::DisputeWindowSecs, &dispute_window_secs);
+
+        // Emit Initialized event
+        let topics = (Symbol::new(&env, "Initialized"),);
+        let data: Val = InitializedEvent {
+            admin: admin.clone(),
+            treasury: treasury.clone(),
+            dispute_window: dispute_window_secs as u32,
+        }
+        .into_val(&env);
+        env.events().publish(topics, data);
     }
 
     pub fn lock_funds(
@@ -266,6 +296,9 @@ impl CoreContract {
         session.status = SessionStatus::Approved;
         Self::save_session(&env, &session_id, &session);
 
+        // Emit SessionApproved event with gross amount, fee, and net payout
+        let timestamp = env.ledger().timestamp();
+        let topics = (Symbol::new(&env, "SessionApproved"), session_id);
         let topics = (symbol_short!("approved"), session_id.clone());
         let topics = (Symbol::new(&env, "fee_deducted"), session_id);
         let fee_data = FeeDeductedEvent {
@@ -282,8 +315,10 @@ impl CoreContract {
             buyer: session.buyer,
             seller: session.seller,
             token: session.token,
+            amount: session.amount,
             payout,
             fee,
+            timestamp,
         }
         .into_val(&env);
         env.events().publish(topics, data);
@@ -543,10 +578,19 @@ impl CoreContract {
         };
 
         env.storage().persistent().set(&key, &session);
-        env.events().publish(
-            (Symbol::new(&env, "FundsLocked"), session_id),
-            (buyer, seller, amount),
-        );
+
+        // Emit FundsLocked event with all relevant session metadata
+        let timestamp = env.ledger().timestamp();
+        let topics = (Symbol::new(&env, "FundsLocked"), session_id.clone());
+        let data: Val = FundsLockedEvent {
+            session_id,
+            buyer,
+            seller,
+            amount,
+            timestamp,
+        }
+        .into_val(&env);
+        env.events().publish(topics, data);
     }
 
     pub fn get_session(env: Env, session_id: u64) -> Session {
