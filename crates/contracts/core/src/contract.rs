@@ -611,11 +611,41 @@ impl CoreContract {
             .get(&DataKey::LockedSession(session_id))
     }
 
+    fn admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("contract not initialized"))
+    }
+
     pub fn treasury(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&DataKey::Treasury)
             .unwrap_or_else(|| panic!("contract not initialized"))
+    }
+
+    pub fn get_treasury(env: Env) -> Address {
+        Self::treasury(env)
+    }
+
+    pub fn set_treasury(env: Env, new_treasury: Address) {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+
+        let old_treasury = Self::treasury(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::Treasury, &new_treasury);
+
+        let topics = (Symbol::new(&env, "TreasuryUpdated"),);
+        let data: Val = TreasuryUpdated {
+            old_treasury,
+            new_treasury: new_treasury.clone(),
+            updated_by: admin,
+        }
+        .into_val(&env);
+        env.events().publish(topics, data);
     }
 
     pub fn fee_bps(env: Env) -> u32 {
