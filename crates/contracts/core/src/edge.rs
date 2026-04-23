@@ -1,34 +1,22 @@
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Bytes, BytesN, Env, IntoVal, Symbol, Val,
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal, Val,
 };
 
 #[derive(Clone)]
 #[contracttype]
-pub enum SessionStatus {
+pub enum EdgeStatus {
     Pending,
     Completed,
     Approved,
-    Locked,
 }
 
 #[derive(Clone)]
 #[contracttype]
-pub struct Session {
+pub struct Edge {
     pub id: u64,
     pub buyer: Address,
     pub seller: Address,
     pub token: Address,
-    pub amount: i128,
-    pub status: SessionStatus,
-}
-
-#[derive(Clone)]
-#[contracttype]
-pub struct LockedSession {
-    pub buyer: Address,
-    pub seller: Address,
     pub amount: i128,
     pub status: SessionStatus,
 }
@@ -40,7 +28,6 @@ enum DataKey {
     FeeBps,
     NextSessionId,
     Session(u64),
-    LockedSession(BytesN<32>),
 }
 
 #[derive(Clone)]
@@ -59,25 +46,6 @@ pub struct SessionApprovedEvent {
 pub struct SessionCompletedEvent {
     pub session_id: u64,
 }
-
-#[derive(Clone)]
-#[contracttype]
-pub struct SessionRefundedEvent {
-    pub session_id: u64,
-    pub buyer: Address,
-    pub seller: Address,
-    pub token: Address,
-    pub refund_amount: i128,
-}
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum ContractError {
-    SessionExists = 1,
-    InvalidAmount = 2,
-}
-
 
 #[contract]
 pub struct CoreContract;
@@ -196,79 +164,11 @@ impl CoreContract {
         env.events().publish(topics, data);
     }
 
-    pub fn refund_session(env: Env, session_id: u64) {
-        let mut session = Self::get_session(env.clone(), session_id);
-        session.buyer.require_auth();
-
-        // Refund only allowed if session is pending (not completed or approved)
-        if !matches!(session.status, SessionStatus::Pending) {
-            panic!("refund only allowed for pending sessions");
-        }
-
-        // Transfer full amount back to buyer (no fee deducted)
-        let contract_address = env.current_contract_address();
-        let token_client = token::Client::new(&env, &session.token);
-        token_client.transfer(&contract_address, &session.buyer, &session.amount);
-
-        // Update session status to indicate refund
-        session.status = SessionStatus::Approved; // Using Approved as final state for refunded sessions
-        env.storage()
-            .persistent()
-            .set(&DataKey::Session(session_id), &session);
-
-        // Emit SessionRefunded event
-        let topics = (symbol_short!("refunded"), session_id);
-        let data = SessionRefundedEvent {
-            session_id,
-            buyer: session.buyer,
-            seller: session.seller,
-            token: session.token,
-            refund_amount: session.amount,
-        };
-        env.events().publish(topics, data);
-    }
-
-    pub fn lock_funds(env: Env, session_id: BytesN<32>, seller: Address, amount: i128) {
-        if amount <= 0 {
-            panic_with_error!(&env, ContractError::InvalidAmount);
-        }
-
-        let key = DataKey::LockedSession(session_id.clone());
-        if env.storage().persistent().has(&key) {
-            panic_with_error!(&env, ContractError::SessionExists);
-        }
-
-        let buyer = env.invoker();
-        buyer.require_auth();
-
-        let native_token = native_token_client(&env);
-        native_token.transfer(&buyer, &env.current_contract_address(), &amount);
-
-        let session = LockedSession {
-            buyer: buyer.clone(),
-            seller: seller.clone(),
-            amount,
-            status: SessionStatus::Locked,
-        };
-
-        env.storage().persistent().set(&key, &session);
-        env.events().publish(
-            (Symbol::new(&env, "FundsLocked"), session_id),
-            (buyer, seller, amount),
-        );
-    }
-
     pub fn get_session(env: Env, session_id: u64) -> Session {
         env.storage()
             .persistent()
             .get(&DataKey::Session(session_id))
             .unwrap_or_else(|| panic!("session not found"))
-    }
-
-    pub fn get_locked_session(env: Env, session_id: BytesN<32>) -> Option<LockedSession> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::LockedSession(session_id))
     }
 
     pub fn treasury(env: Env) -> Address {
@@ -291,22 +191,4 @@ impl CoreContract {
             .get(&DataKey::NextSessionId)
             .unwrap_or_else(|| panic!("contract not initialized"))
     }
-}
-
-fn native_token_client(env: &Env) -> token::Client {
-    let native_token = native_token_address(env);
-    token::Client::new(env, &native_token)
-}
-
-fn native_token_address(env: &Env) -> Address {
-    let serialized_native_asset = Bytes::from_slice(env, &[0, 0, 0, 0]);
-    let deployer = env.deployer().with_stellar_asset(serialized_native_asset);
-    let address = deployer.deployed_address();
-
-    #[cfg(test)]
-    if !address.exists() {
-        deployer.deploy();
-    }
-
-    address
 }
