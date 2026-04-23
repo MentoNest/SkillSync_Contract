@@ -8,9 +8,12 @@ pub enum DataKey {
     Admin,
     WasmHash,
 }
+mod contract;
 
-#[contract]
-pub struct CoreContract;
+pub use contract::{
+    CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
+    SessionStatus,
+};
 
 #[contractimpl]
 impl CoreContract {
@@ -45,3 +48,5 @@ impl CoreContract {
         vec
     }
 }
+#[cfg(test)]
+mod test;
