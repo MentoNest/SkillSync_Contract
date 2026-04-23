@@ -47,6 +47,16 @@ pub struct SessionCompletedEvent {
     pub session_id: u64,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct SessionRefundedEvent {
+    pub session_id: u64,
+    pub buyer: Address,
+    pub seller: Address,
+    pub token: Address,
+    pub refund_amount: i128,
+}
+
 #[contract]
 pub struct CoreContract;
 
@@ -161,6 +171,38 @@ impl CoreContract {
             fee,
         }
         .into_val(&env);
+        env.events().publish(topics, data);
+    }
+
+    pub fn refund_session(env: Env, session_id: u64) {
+        let mut session = Self::get_session(env.clone(), session_id);
+        session.buyer.require_auth();
+
+        // Refund only allowed if session is pending (not completed or approved)
+        if !matches!(session.status, SessionStatus::Pending) {
+            panic!("refund only allowed for pending sessions");
+        }
+
+        // Transfer full amount back to buyer (no fee deducted)
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &session.token);
+        token_client.transfer(&contract_address, &session.buyer, &session.amount);
+
+        // Update session status to indicate refund
+        session.status = SessionStatus::Approved; // Using Approved as final state for refunded sessions
+        env.storage()
+            .persistent()
+            .set(&DataKey::Session(session_id), &session);
+
+        // Emit SessionRefunded event
+        let topics = (symbol_short!("refunded"), session_id);
+        let data = SessionRefundedEvent {
+            session_id,
+            buyer: session.buyer,
+            seller: session.seller,
+            token: session.token,
+            refund_amount: session.amount,
+        };
         env.events().publish(topics, data);
     }
 

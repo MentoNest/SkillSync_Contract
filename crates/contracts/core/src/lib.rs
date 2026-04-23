@@ -4,7 +4,7 @@ mod contract;
 
 pub use contract::{
     CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
-    SessionStatus,
+    SessionRefundedEvent, SessionStatus,
 };
 
 #[cfg(test)]
