@@ -41,6 +41,7 @@ pub struct LockedSession {
 #[derive(Clone)]
 #[contracttype]
 enum DataKey {
+    Admin,
     Treasury,
     FeeBps,
     NextSessionId,
@@ -118,14 +119,15 @@ pub struct CoreContract;
 
 #[contractimpl]
 impl CoreContract {
-    pub fn initialize(env: Env, treasury: Address, fee_bps: u32) {
-        if env.storage().instance().has(&DataKey::Treasury) {
+    pub fn initialize(env: Env, admin: Address, treasury: Address, fee_bps: u32) {
+        if env.storage().instance().has(&DataKey::Admin) {
             panic!("contract already initialized");
         }
         if fee_bps > 10_000 {
             panic!("fee bps must be <= 10000");
         }
 
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage()
@@ -144,6 +146,7 @@ impl CoreContract {
         token: Address,
         amount: i128,
     ) -> u64 {
+        Self::require_initialized(&env);
         buyer.require_auth();
 
         if amount <= 0 {
@@ -178,6 +181,7 @@ impl CoreContract {
     }
 
     pub fn complete_session(env: Env, session_id: u64) {
+        Self::require_initialized(&env);
         let mut session = Self::get_session(env.clone(), session_id);
         session.seller.require_auth();
 
@@ -197,6 +201,7 @@ impl CoreContract {
     }
 
     pub fn approve_session(env: Env, session_id: u64) {
+        Self::require_initialized(&env);
         let mut session = Self::get_session(env.clone(), session_id);
         session.buyer.require_auth();
 
@@ -204,12 +209,10 @@ impl CoreContract {
             panic!("session must be completed");
         }
 
-        let fee_bps = Self::fee_bps(env.clone());
-        let treasury = Self::treasury(env.clone());
-        let fee = session.amount * i128::from(fee_bps) / 10_000;
-        let payout = session.amount - fee;
+        let (payout, fee) = Self::apply_fee(&env, session.amount);
         let contract_address = env.current_contract_address();
         let token_client = token::Client::new(&env, &session.token);
+        let treasury = Self::treasury(env.clone());
 
         if payout > 0 {
             token_client.transfer(&contract_address, &session.seller, &payout);
@@ -222,6 +225,15 @@ impl CoreContract {
         env.storage()
             .persistent()
             .set(&DataKey::Session(session_id), &session);
+
+        let topics = (Symbol::new(&env, "fee_deducted"), session_id);
+        let fee_data = FeeDeductedEvent {
+            session_id,
+            amount: session.amount,
+            fee,
+            bps: Self::fee_bps(env.clone()),
+        };
+        env.events().publish(topics, fee_data);
 
         let topics = (symbol_short!("approved"), session_id);
         let data: Val = SessionApprovedEvent {
@@ -426,6 +438,7 @@ impl CoreContract {
     }
 
     pub fn get_session(env: Env, session_id: u64) -> Session {
+        Self::require_initialized(&env);
         env.storage()
             .persistent()
             .get(&DataKey::Session(session_id))

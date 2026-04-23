@@ -645,8 +645,13 @@ mod test;
 mod contract;
 
 pub use contract::{
+<<<<<<< HEAD
+    CoreContract, CoreContractClient, DisputeResolvedEvent, FeeDeductedEvent, InitializedEvent,
+    RefundEvent, Session, SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
+=======
     CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
     SessionRefundedEvent, SessionStatus,
+>>>>>>> 8ce83833b5b26cd2b768923ee338582d4cb4fd51
 };
 
 #[cfg(test)]
