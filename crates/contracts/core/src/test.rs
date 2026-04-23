@@ -18,6 +18,7 @@ fn setup() -> (
     Address,
     Address,
     Address,
+    Address,
 ) {
     let env = Env::default();
     env.mock_all_auths();
@@ -25,6 +26,7 @@ fn setup() -> (
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
     let treasury = Address::generate(&env);
+    let admin = Address::generate(&env);
     let token_admin = Address::generate(&env);
 
     let token_address = env.register_stellar_asset_contract(token_admin.clone());
@@ -35,23 +37,16 @@ fn setup() -> (
 
     let contract_id = env.register_contract(None, CoreContract);
     let contract = CoreContractClient::new(&env, &contract_id);
-    contract.initialize(&treasury, &500);
+    contract.initialize(&admin, &treasury, &500);
 
     (
-        env,
-        contract,
-        token_client,
-        asset_client,
-        buyer,
-        seller,
-        treasury,
-        contract_id,
+        env, contract, token_client, asset_client, buyer, seller, treasury, admin, contract_id,
     )
 }
 
 #[test]
 fn approve_session_releases_payout_fee_and_event() {
-    let (env, contract, token_client, _, buyer, seller, treasury, contract_id) = setup();
+    let (env, contract, token_client, _, buyer, seller, treasury, _admin, contract_id) = setup();
 
     let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
     contract.complete_session(&session_id);
@@ -72,7 +67,7 @@ fn approve_session_releases_payout_fee_and_event() {
 
 #[test]
 fn approve_session_records_buyer_authorization() {
-    let (env, contract, token_client, _, buyer, seller, _, _) = setup();
+    let (env, contract, token_client, _, buyer, seller, _treasury, _admin, _contract_id) = setup();
 
     let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
     contract.complete_session(&session_id);
@@ -82,4 +77,122 @@ fn approve_session_records_buyer_authorization() {
     let approve_auth = snapshot.auth.0.last().unwrap();
     let auth_debug = std::format!("{:?}", approve_auth);
     assert!(auth_debug.contains("approve_session"));
+}
+
+#[test]
+fn apply_fee_zero_fee() {
+    let (_env, contract, token_client, _, buyer, seller, treasury, _admin, _contract_id) = setup();
+    contract.set_fee_bps(&0);
+
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.approve_session(&session_id);
+
+    assert_eq!(token_client.balance(&seller), 1_000);
+    assert_eq!(token_client.balance(&treasury), 0);
+}
+
+#[test]
+fn apply_fee_max_fee() {
+    let (_env, contract, token_client, _, buyer, seller, treasury, _admin, _contract_id) = setup();
+    contract.set_fee_bps(&10_000);
+
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.approve_session(&session_id);
+
+    assert_eq!(token_client.balance(&seller), 0);
+    assert_eq!(token_client.balance(&treasury), 1_000);
+}
+
+#[test]
+fn apply_fee_rounding() {
+    let (_env, contract, token_client, _, buyer, seller, treasury, _admin, _contract_id) = setup();
+    contract.set_fee_bps(&1);
+
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &10_000);
+    contract.complete_session(&session_id);
+    contract.approve_session(&session_id);
+
+    assert_eq!(token_client.balance(&seller), 9_999);
+    assert_eq!(token_client.balance(&treasury), 1);
+}
+
+#[test]
+fn early_refund_skips_fee() {
+    let (_env, contract, token_client, _, buyer, seller, treasury, _admin, contract_id) = setup();
+
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.refund_session(&session_id);
+
+    let session = contract.get_session(&session_id);
+    assert!(matches!(session.status, SessionStatus::Refunded));
+    assert_eq!(token_client.balance(&buyer), 1_000);
+    assert_eq!(token_client.balance(&seller), 0);
+    assert_eq!(token_client.balance(&treasury), 0);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn late_refund_applies_fee() {
+    let (_env, contract, token_client, _, buyer, seller, treasury, _admin, contract_id) = setup();
+
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.refund_session(&session_id);
+
+    let session = contract.get_session(&session_id);
+    assert!(matches!(session.status, SessionStatus::Refunded));
+    assert_eq!(token_client.balance(&buyer), 950);
+    assert_eq!(token_client.balance(&seller), 0);
+    assert_eq!(token_client.balance(&treasury), 50);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn resolve_dispute_applies_fee_and_splits() {
+    let (_env, contract, token_client, _, buyer, seller, treasury, _admin, contract_id) = setup();
+
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.resolve_dispute(&session_id, &400);
+
+    let session = contract.get_session(&session_id);
+    assert!(matches!(session.status, SessionStatus::Resolved));
+    assert_eq!(token_client.balance(&buyer), 400);
+    assert_eq!(token_client.balance(&seller), 550);
+    assert_eq!(token_client.balance(&treasury), 50);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn resolve_dispute_full_refund_to_buyer() {
+    let (_env, contract, token_client, _, buyer, seller, treasury, _admin, contract_id) = setup();
+
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.resolve_dispute(&session_id, &950);
+
+    let session = contract.get_session(&session_id);
+    assert!(matches!(session.status, SessionStatus::Resolved));
+    assert_eq!(token_client.balance(&buyer), 950);
+    assert_eq!(token_client.balance(&seller), 0);
+    assert_eq!(token_client.balance(&treasury), 50);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn resolve_dispute_zero_buyer_refund() {
+    let (_env, contract, token_client, _, buyer, seller, treasury, _admin, contract_id) = setup();
+
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.resolve_dispute(&session_id, &0);
+
+    let session = contract.get_session(&session_id);
+    assert!(matches!(session.status, SessionStatus::Resolved));
+    assert_eq!(token_client.balance(&buyer), 0);
+    assert_eq!(token_client.balance(&seller), 950);
+    assert_eq!(token_client.balance(&treasury), 50);
+    assert_eq!(token_client.balance(&contract_id), 0);
 }
