@@ -1,5 +1,11 @@
 #![no_std]
 
+pub mod errors;
+pub mod events;
+
+pub use errors::ContractError;
+pub use events::{ContractUpgraded, DisputeResolved, TreasuryUpdated};
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     Env, Symbol, Vec,
