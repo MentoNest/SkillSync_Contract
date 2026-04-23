@@ -1,10 +1,7 @@
 use soroban_sdk::{
-<<<<<<< main
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, Bytes, BytesN, Env, IntoVal, Symbol, Val,
-=======
     contract, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal, Val,
->>>>>>> main
 };
 
 #[derive(Clone)]
@@ -13,10 +10,7 @@ pub enum SessionStatus {
     Pending,
     Completed,
     Approved,
-<<<<<<< main
     Locked,
-=======
->>>>>>> main
 }
 
 #[derive(Clone)]
@@ -32,7 +26,6 @@ pub struct Session {
 
 #[derive(Clone)]
 #[contracttype]
-<<<<<<< main
 pub struct LockedSession {
     pub buyer: Address,
     pub seller: Address,
@@ -42,17 +35,12 @@ pub struct LockedSession {
 
 #[derive(Clone)]
 #[contracttype]
-=======
->>>>>>> main
 enum DataKey {
     Treasury,
     FeeBps,
     NextSessionId,
     Session(u64),
-<<<<<<< main
     LockedSession(BytesN<32>),
-=======
->>>>>>> main
 }
 
 #[derive(Clone)]
@@ -72,7 +60,16 @@ pub struct SessionCompletedEvent {
     pub session_id: u64,
 }
 
-<<<<<<< main
+#[derive(Clone)]
+#[contracttype]
+pub struct SessionRefundedEvent {
+    pub session_id: u64,
+    pub buyer: Address,
+    pub seller: Address,
+    pub token: Address,
+    pub refund_amount: i128,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -81,8 +78,7 @@ pub enum ContractError {
     InvalidAmount = 2,
 }
 
-=======
->>>>>>> main
+
 #[contract]
 pub struct CoreContract;
 
@@ -200,7 +196,38 @@ impl CoreContract {
         env.events().publish(topics, data);
     }
 
-<<<<<<< main
+    pub fn refund_session(env: Env, session_id: u64) {
+        let mut session = Self::get_session(env.clone(), session_id);
+        session.buyer.require_auth();
+
+        // Refund only allowed if session is pending (not completed or approved)
+        if !matches!(session.status, SessionStatus::Pending) {
+            panic!("refund only allowed for pending sessions");
+        }
+
+        // Transfer full amount back to buyer (no fee deducted)
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &session.token);
+        token_client.transfer(&contract_address, &session.buyer, &session.amount);
+
+        // Update session status to indicate refund
+        session.status = SessionStatus::Approved; // Using Approved as final state for refunded sessions
+        env.storage()
+            .persistent()
+            .set(&DataKey::Session(session_id), &session);
+
+        // Emit SessionRefunded event
+        let topics = (symbol_short!("refunded"), session_id);
+        let data = SessionRefundedEvent {
+            session_id,
+            buyer: session.buyer,
+            seller: session.seller,
+            token: session.token,
+            refund_amount: session.amount,
+        };
+        env.events().publish(topics, data);
+    }
+
     pub fn lock_funds(env: Env, session_id: BytesN<32>, seller: Address, amount: i128) {
         if amount <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
@@ -231,8 +258,6 @@ impl CoreContract {
         );
     }
 
-=======
->>>>>>> main
     pub fn get_session(env: Env, session_id: u64) -> Session {
         env.storage()
             .persistent()
@@ -240,15 +265,12 @@ impl CoreContract {
             .unwrap_or_else(|| panic!("session not found"))
     }
 
-<<<<<<< main
     pub fn get_locked_session(env: Env, session_id: BytesN<32>) -> Option<LockedSession> {
         env.storage()
             .persistent()
             .get(&DataKey::LockedSession(session_id))
     }
 
-=======
->>>>>>> main
     pub fn treasury(env: Env) -> Address {
         env.storage()
             .instance()
@@ -270,7 +292,6 @@ impl CoreContract {
             .unwrap_or_else(|| panic!("contract not initialized"))
     }
 }
-<<<<<<< main
 
 fn native_token_client(env: &Env) -> token::Client {
     let native_token = native_token_address(env);
@@ -289,5 +310,3 @@ fn native_token_address(env: &Env) -> Address {
 
     address
 }
-=======
->>>>>>> main

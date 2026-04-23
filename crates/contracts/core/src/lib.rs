@@ -597,7 +597,7 @@ pub use contract::{
     SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
 
     CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
-    SessionStatus,
+    SessionRefundedEvent, SessionStatus,
 };
 
 #[contractimpl]
