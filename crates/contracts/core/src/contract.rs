@@ -44,7 +44,6 @@ enum DataKey {
     Admin,
     Treasury,
     FeeBps,
-    NextSessionId,
     Session(u64),
     DisputeWindowSecs,
     LockedSession(BytesN<32>),
@@ -139,16 +138,20 @@ impl CoreContract {
             .set(&DataKey::DisputeWindowSecs, &604800_u64);
     }
 
-    pub fn create_session(
+    pub fn lock_funds(
         env: Env,
+        session_id: u64,
         buyer: Address,
         seller: Address,
         token: Address,
         amount: i128,
-    ) -> u64 {
+    ) {
         Self::require_initialized(&env);
         buyer.require_auth();
 
+        if env.storage().persistent().has(&DataKey::Session(session_id)) {
+            panic!("session already exists");
+        }
         if amount <= 0 {
             panic!("amount must be positive");
         }
@@ -156,11 +159,10 @@ impl CoreContract {
             panic!("buyer and seller must differ");
         }
 
-        let session_id = Self::next_session_id(&env);
         let session = Session {
             id: session_id,
             buyer: buyer.clone(),
-            seller,
+            seller: seller.clone(),
             token: token.clone(),
             amount,
             status: SessionStatus::Pending,
@@ -173,11 +175,16 @@ impl CoreContract {
         env.storage()
             .persistent()
             .set(&DataKey::Session(session_id), &session);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextSessionId, &(session_id + 1));
 
-        session_id
+        let topics = (symbol_short!("locked"), session_id);
+        let data = FundsLockedEvent {
+            session_id,
+            buyer,
+            seller,
+            token,
+            amount,
+        };
+        env.events().publish(topics, data);
     }
 
     pub fn complete_session(env: Env, session_id: u64) {
