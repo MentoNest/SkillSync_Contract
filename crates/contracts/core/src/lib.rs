@@ -1,5 +1,8 @@
 #![no_std]
 
+pub mod error_codes;
+
+pub use error_codes::{AuthError, FinancialError, InitError, SessionError};
 pub mod errors;
 pub mod events;
 
