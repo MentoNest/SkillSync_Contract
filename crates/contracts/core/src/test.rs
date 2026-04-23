@@ -275,3 +275,73 @@ fn uninitialized_admin_reverts() {
     let contract = CoreContractClient::new(&env, &contract_id);
     contract.admin();
 }
+
+#[test]
+fn happy_path_lock_complete_approve_payout_and_events() {
+    let (env, contract, token_client, _, buyer, seller, treasury, _admin, contract_id) = setup();
+
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    assert!(matches!(contract.get_session(&session_id).status, SessionStatus::Pending));
+
+    contract.complete_session(&session_id);
+    assert!(matches!(contract.get_session(&session_id).status, SessionStatus::Completed));
+
+    contract.approve_session(&session_id);
+    assert!(matches!(contract.get_session(&session_id).status, SessionStatus::Approved));
+
+    assert_eq!(token_client.balance(&buyer), 0);
+    assert_eq!(token_client.balance(&seller), 950);
+    assert_eq!(token_client.balance(&treasury), 50);
+    assert_eq!(token_client.balance(&contract_id), 0);
+
+    let events = env.events().all();
+    let topics: Vec<String> = events.iter().map(|e| std::format!("{:?}", e.1)).collect();
+    let completed_idx = topics.iter().position(|t| t.contains("completed")).unwrap();
+    let fee_idx = topics.iter().position(|t| t.contains("fee_deducted")).unwrap();
+    let approved_idx = topics.iter().position(|t| t.contains("approved")).unwrap();
+
+    assert!(completed_idx < fee_idx, "completed event should come before fee_deducted");
+    assert!(fee_idx < approved_idx, "fee_deducted event should come before approved");
+}
+
+#[test]
+#[should_panic(expected = "session not found")]
+fn seller_cannot_complete_without_lock() {
+    let (_, contract, _, _, _, _, _, _, _) = setup();
+    contract.complete_session(&999);
+}
+
+#[test]
+#[should_panic(expected = "session must be pending")]
+fn seller_cannot_complete_twice() {
+    let (_, contract, token_client, _, buyer, seller, _, _, _) = setup();
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.complete_session(&session_id);
+}
+
+#[test]
+#[should_panic(expected = "session must be completed")]
+fn buyer_cannot_approve_before_completion() {
+    let (_, contract, token_client, _, buyer, seller, _, _, _) = setup();
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.approve_session(&session_id);
+}
+
+#[test]
+fn platform_fee_deducted_correctly() {
+    let (_, contract, token_client, _, buyer, seller, treasury, _, _) = setup();
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.approve_session(&session_id);
+    assert_eq!(token_client.balance(&treasury), 50);
+}
+
+#[test]
+fn seller_receives_correct_payout() {
+    let (_, contract, token_client, _, buyer, seller, _, _, _) = setup();
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    contract.complete_session(&session_id);
+    contract.approve_session(&session_id);
+    assert_eq!(token_client.balance(&seller), 950);
+}
