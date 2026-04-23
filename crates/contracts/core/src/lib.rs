@@ -3,8 +3,8 @@
 mod contract;
 
 pub use contract::{
-    CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
-    SessionStatus,
+    AutoRefundExecutedEvent, CoreContract, CoreContractClient, Session, SessionApprovedEvent,
+    SessionCompletedEvent, SessionStatus,
 };
 
 #[cfg(test)]

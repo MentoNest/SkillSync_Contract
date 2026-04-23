@@ -8,6 +8,7 @@ pub enum SessionStatus {
     Pending,
     Completed,
     Approved,
+    Refunded,
 }
 
 #[derive(Clone)]
@@ -19,6 +20,7 @@ pub struct Session {
     pub token: Address,
     pub amount: i128,
     pub status: SessionStatus,
+    pub completed_at: u64,
 }
 
 #[derive(Clone)]
@@ -28,6 +30,7 @@ enum DataKey {
     FeeBps,
     NextSessionId,
     Session(u64),
+    DisputeWindowSecs,
 }
 
 #[derive(Clone)]
@@ -45,6 +48,14 @@ pub struct SessionApprovedEvent {
 #[contracttype]
 pub struct SessionCompletedEvent {
     pub session_id: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct AutoRefundExecutedEvent {
+    pub session_id: u64,
+    pub buyer: Address,
+    pub amount: i128,
 }
 
 #[contract]
@@ -65,6 +76,10 @@ impl CoreContract {
         env.storage()
             .instance()
             .set(&DataKey::NextSessionId, &1_u64);
+        // Default dispute window: 7 days (604800 seconds)
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeWindowSecs, &604800_u64);
     }
 
     pub fn create_session(
@@ -91,6 +106,7 @@ impl CoreContract {
             token: token.clone(),
             amount,
             status: SessionStatus::Pending,
+            completed_at: 0,
         };
 
         let token_client = token::Client::new(&env, &token);
@@ -115,6 +131,7 @@ impl CoreContract {
         }
 
         session.status = SessionStatus::Completed;
+        session.completed_at = env.ledger().timestamp();
         env.storage()
             .persistent()
             .set(&DataKey::Session(session_id), &session);
@@ -164,6 +181,43 @@ impl CoreContract {
         env.events().publish(topics, data);
     }
 
+    pub fn auto_refund(env: Env, session_id: u64) {
+        let mut session = Self::get_session(env.clone(), session_id);
+
+        if !matches!(session.status, SessionStatus::Completed) {
+            panic!("session must be completed");
+        }
+
+        let dispute_window_secs = Self::dispute_window_secs(env.clone());
+        let current_time = env.ledger().timestamp();
+        let time_since_completion = current_time - session.completed_at;
+
+        if time_since_completion < dispute_window_secs {
+            panic!("dispute window has not expired");
+        }
+
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &session.token);
+
+        // Refund full amount to buyer
+        token_client.transfer(&contract_address, &session.buyer, &session.amount);
+
+        session.status = SessionStatus::Refunded;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Session(session_id), &session);
+
+        // Emit AutoRefundExecuted event
+        let topics = (symbol_short!("autorefund"), session_id);
+        let data: Val = AutoRefundExecutedEvent {
+            session_id,
+            buyer: session.buyer.clone(),
+            amount: session.amount,
+        }
+        .into_val(&env);
+        env.events().publish(topics, data);
+    }
+
     pub fn get_session(env: Env, session_id: u64) -> Session {
         env.storage()
             .persistent()
@@ -182,6 +236,13 @@ impl CoreContract {
         env.storage()
             .instance()
             .get(&DataKey::FeeBps)
+            .unwrap_or_else(|| panic!("contract not initialized"))
+    }
+
+    pub fn dispute_window_secs(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DisputeWindowSecs)
             .unwrap_or_else(|| panic!("contract not initialized"))
     }
 
