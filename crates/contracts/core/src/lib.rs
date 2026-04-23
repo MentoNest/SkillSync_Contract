@@ -3,7 +3,8 @@
 mod contract;
 
 pub use contract::{
-    ContractError, CoreContract, CoreContractClient, LockedSession, Session, SessionStatus,
+    ContractError, CoreContract, CoreContractClient, LockedSession, Session,
+    SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
 };
 
 #[cfg(test)]

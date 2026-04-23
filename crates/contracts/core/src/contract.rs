@@ -1,10 +1,10 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Bytes, BytesN, Env, Symbol,
+    Address, Bytes, BytesN, Env, IntoVal, Symbol, Val,
 };
 
+#[derive(Clone)]
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionStatus {
     Pending,
     Completed,
@@ -12,8 +12,8 @@ pub enum SessionStatus {
     Locked,
 }
 
+#[derive(Clone)]
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Session {
     pub id: u64,
     pub buyer: Address,
@@ -23,8 +23,8 @@ pub struct Session {
     pub status: SessionStatus,
 }
 
+#[derive(Clone)]
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockedSession {
     pub buyer: Address,
     pub seller: Address,
@@ -32,8 +32,8 @@ pub struct LockedSession {
     pub status: SessionStatus,
 }
 
-#[contracttype]
 #[derive(Clone)]
+#[contracttype]
 enum DataKey {
     Treasury,
     FeeBps,
@@ -42,8 +42,8 @@ enum DataKey {
     LockedSession(BytesN<32>),
 }
 
+#[derive(Clone)]
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionApprovedEvent {
     pub session_id: u64,
     pub buyer: Address,
@@ -53,8 +53,8 @@ pub struct SessionApprovedEvent {
     pub fee: i128,
 }
 
+#[derive(Clone)]
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionCompletedEvent {
     pub session_id: u64,
 }
@@ -113,7 +113,7 @@ impl CoreContract {
             status: SessionStatus::Pending,
         };
 
-        let token_client = token::TokenClient::new(&env, &token);
+        let token_client = token::Client::new(&env, &token);
         token_client.transfer(&buyer, &env.current_contract_address(), &amount);
 
         env.storage()
@@ -157,7 +157,7 @@ impl CoreContract {
         let fee = session.amount * i128::from(fee_bps) / 10_000;
         let payout = session.amount - fee;
         let contract_address = env.current_contract_address();
-        let token_client = token::TokenClient::new(&env, &session.token);
+        let token_client = token::Client::new(&env, &session.token);
 
         if payout > 0 {
             token_client.transfer(&contract_address, &session.seller, &payout);
@@ -166,24 +166,21 @@ impl CoreContract {
             token_client.transfer(&contract_address, &treasury, &fee);
         }
 
-        let buyer = session.buyer.clone();
-        let seller = session.seller.clone();
-        let token = session.token.clone();
-
         session.status = SessionStatus::Approved;
         env.storage()
             .persistent()
             .set(&DataKey::Session(session_id), &session);
 
         let topics = (symbol_short!("approved"), session_id);
-        let data = SessionApprovedEvent {
+        let data: Val = SessionApprovedEvent {
             session_id,
-            buyer,
-            seller,
-            token,
+            buyer: session.buyer,
+            seller: session.seller,
+            token: session.token,
             payout,
             fee,
-        };
+        }
+        .into_val(&env);
         env.events().publish(topics, data);
     }
 
@@ -252,9 +249,9 @@ impl CoreContract {
     }
 }
 
-fn native_token_client(env: &Env) -> token::TokenClient {
+fn native_token_client(env: &Env) -> token::Client {
     let native_token = native_token_address(env);
-    token::TokenClient::new(env, &native_token)
+    token::Client::new(env, &native_token)
 }
 
 fn native_token_address(env: &Env) -> Address {
