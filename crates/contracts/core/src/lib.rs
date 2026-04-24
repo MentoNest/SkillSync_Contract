@@ -2,9 +2,10 @@
 
 pub mod error_codes;
 
-pub use error_codes::{AuthError, FinancialError, InitError, SessionError};
+pub use error_codes::{AuthError, FinancialError, InitError, SessionError, TimeoutDisputeError, UpgradeError};
 pub mod errors;
 pub mod events;
+pub mod oracle;
 
 pub use errors::ContractError;
 pub use events::{ContractUpgraded, DisputeResolved, TreasuryUpdated};
