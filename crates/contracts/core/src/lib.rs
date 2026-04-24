@@ -772,8 +772,12 @@ impl CoreContract {
         vec
     }
 }
+
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod test_storage_persistence;
 
 #![no_std]
 
