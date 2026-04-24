@@ -592,8 +592,8 @@ pub enum DataKey {
 mod contract;
 
 pub use contract::{
-    AutoRefundExecutedEvent, CoreContract, CoreContractClient, Session, SessionApprovedEvent,
-    SessionCompletedEvent, SessionStatus,
+    AutoRefundExecutedEvent, CoreContract, CoreContractClient, FundsLockedEvent, InitializedEvent,
+    Session, SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
 
     ContractError, CoreContract, CoreContractClient, LockedSession, Session,
     SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
