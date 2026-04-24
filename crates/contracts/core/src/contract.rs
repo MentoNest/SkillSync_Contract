@@ -256,23 +256,18 @@ impl CoreContract {
             .persistent()
             .set(&DataKey::Session(session_id), &session);
 
-        let topics = (Symbol::new(&env, "fee_deducted"), session_id);
-        let fee_data = FeeDeductedEvent {
-            session_id,
-            amount: session.amount,
-            fee,
-            bps: Self::fee_bps(env.clone()),
-        };
-        env.events().publish(topics, fee_data);
-
-        let topics = (symbol_short!("approved"), session_id);
+        // Emit SessionApproved event with gross amount, fee, and net payout
+        let timestamp = env.ledger().timestamp();
+        let topics = (Symbol::new(&env, "SessionApproved"), session_id);
         let data: Val = SessionApprovedEvent {
             session_id,
             buyer: session.buyer,
             seller: session.seller,
             token: session.token,
+            amount: session.amount,
             payout,
             fee,
+            timestamp,
         }
         .into_val(&env);
         env.events().publish(topics, data);
