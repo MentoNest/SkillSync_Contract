@@ -228,7 +228,7 @@ impl SkillSyncContract {
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::PlatformFee, &platform_fee_bps);
         env.storage()
             .instance()
@@ -262,12 +262,12 @@ impl SkillSyncContract {
 
         let old_fee_bps: u32 = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::PlatformFee)
             .unwrap_or(0);
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::PlatformFee, &new_fee_bps);
 
         env.events().publish(
@@ -280,6 +280,13 @@ impl SkillSyncContract {
         );
 
         Ok(())
+    }
+
+    pub fn get_platform_fee(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PlatformFee)
+            .unwrap_or(0)
     }
 
     /// Update the treasury wallet. Only callable by admin.
@@ -332,7 +339,7 @@ impl SkillSyncContract {
         payee: Address,
         asset: Address,
         amount: i128,
-        fee_bps: u32,
+        _fee_bps: u32,
     ) -> Result<(), Error> {
         acquire_lock(&env)?;
 
@@ -344,6 +351,7 @@ impl SkillSyncContract {
         let dispute_window = Self::get_dispute_window(env.clone());
         let dispute_deadline = now + dispute_window;
         let expires_at = now + ESCROW_DURATION_SECONDS;
+        let fee_bps = Self::get_platform_fee(env.clone());
 
         let fee = amount
             .checked_mul(fee_bps as i128)
