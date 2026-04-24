@@ -1,7 +1,6 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, Bytes, BytesN, Env, IntoVal, Symbol, Val,
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal, Val,
 };
 
 #[derive(Clone)]
@@ -48,6 +47,14 @@ enum DataKey {
     Session(u64),
     DisputeWindowSecs,
     LockedSession(BytesN<32>),
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct InitializedEvent {
+    pub admin: Address,
+    pub treasury: Address,
+    pub dispute_window: u32,
 }
 
 #[derive(Clone)]
@@ -134,9 +141,20 @@ impl CoreContract {
             .instance()
             .set(&DataKey::NextSessionId, &1_u64);
         // Default dispute window: 7 days (604800 seconds)
+        let dispute_window_secs: u64 = 604800;
         env.storage()
             .instance()
-            .set(&DataKey::DisputeWindowSecs, &604800_u64);
+            .set(&DataKey::DisputeWindowSecs, &dispute_window_secs);
+
+        // Emit Initialized event
+        let topics = (Symbol::new(&env, "Initialized"),);
+        let data: Val = InitializedEvent {
+            admin: admin.clone(),
+            treasury: treasury.clone(),
+            dispute_window: dispute_window_secs as u32,
+        }
+        .into_val(&env);
+        env.events().publish(topics, data);
     }
 
     pub fn create_session(
