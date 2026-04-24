@@ -67,3 +67,29 @@ pub enum FinancialError {
     /// Arithmetic overflow detected.
     Overflow = 404,
 }
+
+/// Errors for timeout and dispute operations (issue #159).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum TimeoutDisputeError {
+    /// Cannot auto-refund yet — dispute window has not elapsed.
+    DisputeWindowNotElapsed = 500,
+    /// Dispute already exists for this session.
+    DisputeAlreadyOpen = 501,
+    /// No open dispute to resolve on this session.
+    DisputeNotOpen = 502,
+    /// Session is not eligible for resolution.
+    ResolutionNotAllowed = 503,
+}
+
+/// Errors for contract upgrade failures (issue #160).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum UpgradeError {
+    /// Provided WASM hash is zero or invalid.
+    InvalidWasmHash = 600,
+    /// Low-level upgrade failure.
+    UpgradeFailed = 601,
+}
