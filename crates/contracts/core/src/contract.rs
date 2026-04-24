@@ -59,13 +59,25 @@ pub struct InitializedEvent {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct FundsLockedEvent {
+    pub session_id: BytesN<32>,
+    pub buyer: Address,
+    pub seller: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct SessionApprovedEvent {
     pub session_id: u64,
     pub buyer: Address,
     pub seller: Address,
     pub token: Address,
+    pub amount: i128,
     pub payout: i128,
     pub fee: i128,
+    pub timestamp: u64,
 }
 
 #[derive(Clone)]
@@ -449,10 +461,19 @@ impl CoreContract {
         };
 
         env.storage().persistent().set(&key, &session);
-        env.events().publish(
-            (Symbol::new(&env, "FundsLocked"), session_id),
-            (buyer, seller, amount),
-        );
+
+        // Emit FundsLocked event with all relevant session metadata
+        let timestamp = env.ledger().timestamp();
+        let topics = (Symbol::new(&env, "FundsLocked"), session_id.clone());
+        let data: Val = FundsLockedEvent {
+            session_id,
+            buyer,
+            seller,
+            amount,
+            timestamp,
+        }
+        .into_val(&env);
+        env.events().publish(topics, data);
     }
 
     pub fn get_session(env: Env, session_id: u64) -> Session {
