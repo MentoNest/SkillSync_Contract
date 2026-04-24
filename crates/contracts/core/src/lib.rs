@@ -282,6 +282,34 @@ impl SkillSyncContract {
         Ok(())
     }
 
+    /// Update the treasury wallet. Only callable by admin.
+    /// Emits TreasuryUpdated event (closes issue #152).
+    pub fn set_treasury(env: Env, new_treasury: Address) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        let old_treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(Error::NotInitialized)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Treasury, &new_treasury);
+
+        env.events().publish(
+            (Symbol::new(&env, "TreasuryUpdated"),),
+            TreasuryUpdated {
+                old_treasury,
+                new_treasury,
+                updated_by: admin,
+            },
+        );
+
+        Ok(())
+    }
+
     pub fn put_session(env: Env, session: Session) -> Result<(), Error> {
         let key = DataKey::Session(session.session_id.clone());
         if env.storage().persistent().has(&key) {
