@@ -537,12 +537,10 @@ impl SkillSyncContract {
     pub fn resolve_dispute(
         env: Env,
         session_id: Bytes,
-        to_payer: i128,
-        to_payee: i128,
-        note: Option<Bytes>,
+        resolution: u32,
+        buyer_share: i128,
+        seller_share: i128,
     ) -> Result<(), Error> {
-        validate_note(&note)?;
-
         let admin = read_admin(&env)?;
         admin.require_auth();
 
@@ -552,31 +550,48 @@ impl SkillSyncContract {
             return Err(Error::SessionNotDisputed);
         }
 
+        if buyer_share < 0 || seller_share < 0 {
+            return Err(Error::InvalidResolutionAmount);
+        }
+
+        let total_shares = buyer_share
+            .checked_add(seller_share)
+            .ok_or(Error::InvalidResolutionAmount)?;
+
+        if total_shares != session.amount {
+            return Err(Error::InvalidResolutionAmount);
+        }
+
+        match resolution {
+            0 => {
+                if buyer_share != session.amount || seller_share != 0 {
+                    return Err(Error::InvalidResolutionAmount);
+                }
+            }
+            1 => {
+                if buyer_share != 0 || seller_share != session.amount {
+                    return Err(Error::InvalidResolutionAmount);
+                }
+            }
+            2 => {}
+            _ => return Err(Error::InvalidResolutionAmount),
+        }
+
         let fee = session.amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
             .ok_or(Error::FeeCalculationOverflow)?;
 
-        let _total_available = session.amount.checked_add(fee).ok_or(Error::FeeCalculationOverflow)?;
-
-        if to_payer + to_payee != session.amount {
-            return Err(Error::InvalidResolutionAmount);
-        }
-
-        if to_payer < 0 || to_payee < 0 {
-            return Err(Error::InvalidResolutionAmount);
-        }
-
         let treasury = Self::get_treasury(env.clone());
         let token_client = token::Client::new(&env, &session.asset);
         let contract_id = env.current_contract_address();
 
-        if to_payer > 0 {
-            token_client.transfer(&contract_id, &session.payer, &to_payer);
+        if buyer_share > 0 {
+            token_client.transfer(&contract_id, &session.payer, &buyer_share);
         }
-        if to_payee > 0 {
-            token_client.transfer(&contract_id, &session.payee, &to_payee);
+        if seller_share > 0 {
+            token_client.transfer(&contract_id, &session.payee, &seller_share);
         }
         if fee > 0 {
             token_client.transfer(&contract_id, &treasury, &fee);
@@ -586,8 +601,8 @@ impl SkillSyncContract {
         session.status = SessionStatus::Resolved;
         session.updated_at = now;
         session.resolved_at = now;
-        session.resolver = Some(admin);
-        session.resolution_note = note;
+        session.resolver = Some(admin.clone());
+        session.resolution_note = None;
 
         let key = DataKey::Session(session_id.clone());
         env.storage().persistent().set(&key, &session);
@@ -596,7 +611,14 @@ impl SkillSyncContract {
 
         env.events().publish(
             (Symbol::new(&env, "DisputeResolved"),),
-            (session_id, to_payer, to_payee, fee),
+            DisputeResolved {
+                session_id,
+                resolver: admin,
+                buyer_share,
+                seller_share,
+                fee,
+                timestamp: now,
+            },
         );
 
         Ok(())
