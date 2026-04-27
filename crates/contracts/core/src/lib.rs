@@ -63,11 +63,12 @@ enum DataKey {
 pub enum SessionStatus {
     Pending = 0,
     Completed = 1,
-    Disputed = 2,
-    Cancelled = 3,
-    Locked = 4,
-    Resolved = 5,
-    Refunded = 6,
+    Approved = 2,
+    Disputed = 3,
+    Cancelled = 4,
+    Locked = 5,
+    Resolved = 6,
+    Refunded = 7,
 }
 
 #[contracttype]
@@ -682,7 +683,7 @@ impl SkillSyncContract {
 
         // Update session
         let now = env.ledger().timestamp();
-        session.status = SessionStatus::Resolved; // Or should it be Approved? But Approved doesn't exist
+        session.status = SessionStatus::Approved;
         session.updated_at = now;
         session.approved_at = now;
 
