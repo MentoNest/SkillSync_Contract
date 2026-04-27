@@ -69,3 +69,26 @@ pub struct OffchainApprovalExecuted {
     /// Ledger timestamp at the moment of approval.
     pub timestamp: u64,
 }
+
+/// Emitted when a session is approved on-chain.
+/// Similar to OffchainApprovalExecuted but for on-chain approvals.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SessionApprovedEvent {
+    /// Identifier of the session that was approved.
+    pub session_id: Bytes,
+    /// Address of the buyer who approved.
+    pub buyer: Address,
+    /// Address of the seller who receives payment.
+    pub seller: Address,
+    /// Token address.
+    pub token: Address,
+    /// Total amount of the session.
+    pub amount: i128,
+    /// Amount paid to the seller.
+    pub payout: i128,
+    /// Platform fee collected.
+    pub fee: i128,
+    /// Ledger timestamp at the moment of approval.
+    pub timestamp: u64,
+}

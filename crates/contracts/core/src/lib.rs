@@ -8,7 +8,7 @@ pub mod events;
 pub mod oracle;
 
 pub use errors::ContractError;
-pub use events::{ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, TreasuryUpdated};
+pub use events::{ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, SessionApprovedEvent, TreasuryUpdated};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
@@ -757,11 +757,13 @@ impl SkillSyncContract {
 
         // Emit event (assuming there's a SessionApprovedEvent, but since it's not defined, I'll use OffchainApprovalExecuted for now)
         env.events().publish(
-            (Symbol::new(&env, "OffchainApprovalExecuted"),),
-            OffchainApprovalExecuted {
+            (Symbol::new(&env, "SessionApproved"),),
+            SessionApprovedEvent {
                 session_id,
                 buyer: session.payer,
                 seller: session.payee,
+                token: session.asset,
+                amount: session.amount,
                 payout,
                 fee,
                 timestamp: now,
