@@ -11,7 +11,7 @@ pub use errors::ContractError;
 pub use events::{ContractUpgraded, DisputeResolved, TreasuryUpdated};
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
+    contract, contracterror, contractimpl, contracttype, crypto, panic_with_error, token, Address, Bytes,
     Env, Symbol, Vec,
 };
 
