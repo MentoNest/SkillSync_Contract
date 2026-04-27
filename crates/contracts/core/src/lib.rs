@@ -8,7 +8,7 @@ pub mod events;
 pub mod oracle;
 
 pub use errors::ContractError;
-pub use events::{ContractUpgraded, DisputeResolved, TreasuryUpdated};
+pub use events::{ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, TreasuryUpdated};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, crypto, panic_with_error, token, Address, Bytes,

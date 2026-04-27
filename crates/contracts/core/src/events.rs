@@ -50,3 +50,22 @@ pub struct ContractUpgraded {
     /// Ledger timestamp at the moment of the upgrade.
     pub timestamp: u64,
 }
+
+/// Emitted when a session is approved using off-chain signatures.
+/// Closes issue #xxx.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct OffchainApprovalExecuted {
+    /// Identifier of the session that was approved.
+    pub session_id: Bytes,
+    /// Address of the buyer who signed.
+    pub buyer: Address,
+    /// Address of the seller who signed.
+    pub seller: Address,
+    /// Amount paid to the seller.
+    pub payout: i128,
+    /// Platform fee collected.
+    pub fee: i128,
+    /// Ledger timestamp at the moment of approval.
+    pub timestamp: u64,
+}
