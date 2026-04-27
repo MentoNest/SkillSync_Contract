@@ -8,7 +8,7 @@ pub mod events;
 pub mod oracle;
 
 pub use errors::ContractError;
-pub use events::{ContractUpgraded, DisputeResolved, TreasuryUpdated};
+pub use events::{ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, SessionApprovedEvent, TreasuryUpdated};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
@@ -63,11 +63,12 @@ enum DataKey {
 pub enum SessionStatus {
     Pending = 0,
     Completed = 1,
-    Disputed = 2,
-    Cancelled = 3,
-    Locked = 4,
-    Resolved = 5,
-    Refunded = 6,
+    Approved = 2,
+    Disputed = 3,
+    Cancelled = 4,
+    Locked = 5,
+    Resolved = 6,
+    Refunded = 7,
 }
 
 #[contracttype]
@@ -208,6 +209,7 @@ pub enum Error {
     InvalidSessionId = 32,       // Session ID empty or too long
     InvalidNote = 33,            // Note too long
     AmountTooLarge = 34,         // Amount exceeds maximum allowed
+    InvalidSignature = 35,       // Invalid cryptographic signature
     Reentrancy = 35,             // Reentrant call detected
 }
 
@@ -316,6 +318,49 @@ impl SkillSyncContract {
         );
 
         Ok(())
+    }
+
+    pub fn create_session(
+        env: Env,
+        payer: Address,
+        payee: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<Bytes, Error> {
+        payer.require_auth();
+
+        let fee_bps = Self::get_platform_fee(env.clone());
+        let session_id = Self::generate_session_id(&env);
+
+        // Create session
+        let session = Session {
+            version: VERSION,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: asset.clone(),
+            amount,
+            fee_bps,
+            status: SessionStatus::Locked,
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
+            dispute_deadline: env.ledger().timestamp() + Self::get_dispute_window(env.clone()),
+            expires_at: env.ledger().timestamp() + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            dispute_opened_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+
+        Self::put_session(env.clone(), session)?;
+
+        // Lock funds
+        Self::lock_funds(env, session_id.clone(), payer, payee, asset, amount, fee_bps)?;
+
+        Ok(session_id)
     }
 
     pub fn put_session(env: Env, session: Session) -> Result<(), Error> {
@@ -622,6 +667,170 @@ impl SkillSyncContract {
         );
 
         Ok(())
+    }
+
+    /// Approve a session using off-chain signatures from both buyer and seller.
+    /// This allows completing the session without requiring on-chain transactions from both parties.
+    /// Emits OffchainApprovalExecuted event.
+    pub fn approve_with_signature(
+        env: Env,
+        session_id: Bytes,
+        buyer_nonce: u64,
+        seller_nonce: u64,
+        buyer_sig: Bytes,
+        seller_sig: Bytes,
+    ) -> Result<(), Error> {
+        // Get the session
+        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+
+        // Check session status
+        if session.status != SessionStatus::Completed {
+            return Err(Error::InvalidSessionStatus);
+        }
+
+        // Verify buyer signature
+        let buyer_message = Self::create_approval_message(&env, &session_id, buyer_nonce);
+        if !env.crypto().ed25519_verify(session.payer.clone(), buyer_message, buyer_sig) {
+            return Err(Error::InvalidSignature);
+        }
+
+        // Verify seller signature
+        let seller_message = Self::create_approval_message(&env, &session_id, seller_nonce);
+        if !env.crypto().ed25519_verify(session.payee.clone(), seller_message, seller_sig) {
+            return Err(Error::InvalidSignature);
+        }
+
+        // Use nonces
+        use_nonce(&env, &session.payer, buyer_nonce)?;
+        use_nonce(&env, &session.payee, seller_nonce)?;
+
+        // Calculate fee and payout
+        let fee = session.amount
+            .checked_mul(session.fee_bps as i128)
+            .ok_or(Error::FeeCalculationOverflow)?
+            .checked_div(10000)
+            .ok_or(Error::FeeCalculationOverflow)?;
+        let payout = session.amount.checked_sub(fee).ok_or(Error::FeeCalculationOverflow)?;
+
+        // Transfer funds
+        let token_client = token::Client::new(&env, &session.asset);
+        let contract_id = env.current_contract_address();
+        let treasury = Self::get_treasury(env.clone());
+
+        if payout > 0 {
+            token_client.transfer(&contract_id, &session.payee, &payout);
+        }
+        if fee > 0 {
+            token_client.transfer(&contract_id, &treasury, &fee);
+        }
+
+        // Update session
+        let now = env.ledger().timestamp();
+        session.status = SessionStatus::Approved;
+        session.updated_at = now;
+        session.approved_at = now;
+
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &session);
+
+        Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "OffchainApprovalExecuted"),),
+            OffchainApprovalExecuted {
+                session_id,
+                buyer: session.payer,
+                seller: session.payee,
+                payout,
+                fee,
+                timestamp: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Approve a session by the buyer after completion.
+    /// This transfers funds to the seller and collects the platform fee.
+    pub fn approve_session(env: Env, session_id: Bytes, caller: Address, nonce: u64) -> Result<(), Error> {
+        use_nonce(&env, &caller, nonce)?;
+        caller.require_auth();
+
+        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+
+        if session.status != SessionStatus::Completed {
+            return Err(Error::InvalidSessionStatus);
+        }
+
+        if caller != session.payer {
+            return Err(Error::NotAuthorizedParty);
+        }
+
+        // Calculate fee and payout
+        let fee = session.amount
+            .checked_mul(session.fee_bps as i128)
+            .ok_or(Error::FeeCalculationOverflow)?
+            .checked_div(10000)
+            .ok_or(Error::FeeCalculationOverflow)?;
+        let payout = session.amount.checked_sub(fee).ok_or(Error::FeeCalculationOverflow)?;
+
+        // Transfer funds
+        let token_client = token::Client::new(&env, &session.asset);
+        let contract_id = env.current_contract_address();
+        let treasury = Self::get_treasury(env.clone());
+
+        if payout > 0 {
+            token_client.transfer(&contract_id, &session.payee, &payout);
+        }
+        if fee > 0 {
+            token_client.transfer(&contract_id, &treasury, &fee);
+        }
+
+        // Update session
+        let now = env.ledger().timestamp();
+        session.status = SessionStatus::Approved;
+        session.updated_at = now;
+        session.approved_at = now;
+
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &session);
+
+        Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
+
+        // Emit event (assuming there's a SessionApprovedEvent, but since it's not defined, I'll use OffchainApprovalExecuted for now)
+        env.events().publish(
+            (Symbol::new(&env, "SessionApproved"),),
+            SessionApprovedEvent {
+                session_id,
+                buyer: session.payer,
+                seller: session.payee,
+                token: session.asset,
+                amount: session.amount,
+                payout,
+                fee,
+                timestamp: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    fn create_approval_message(env: &Env, session_id: &Bytes, nonce: u64) -> Bytes {
+        let mut message = Bytes::new(env);
+        message.extend_from_slice(&session_id.clone());
+        message.extend_from_slice(&nonce.to_be_bytes());
+        message
+    }
+
+    fn generate_session_id(env: &Env) -> Bytes {
+        let mut id = Bytes::new(env);
+        // Use ledger sequence and contract address for uniqueness
+        let seq = env.ledger().sequence();
+        id.extend_from_slice(&seq.to_be_bytes());
+        let contract_id = env.current_contract_address();
+        id.extend_from_slice(contract_id.as_bytes());
+        id
     }
 
     pub fn get_dispute_window(env: Env) -> u64 {

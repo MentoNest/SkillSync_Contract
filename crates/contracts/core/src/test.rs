@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::{CoreContract, CoreContractClient};
+use crate::{SkillSyncContract, SkillSyncContractClient, DEFAULT_DISPUTE_WINDOW_SECONDS};
 use soroban_sdk::{symbol_short, testutils::Address as _, vec, Address, BytesN, Env};
 extern crate std;
 
@@ -58,9 +58,9 @@ fn setup_with_fee(fee_bps: u32) -> (
     let token_client = TokenClient::new(&env, &token_address);
     let asset_client = StellarAssetClient::new(&env, &token_address);
 
-    let contract_id = env.register_contract(None, CoreContract);
-    let contract = CoreContractClient::new(&env, &contract_id);
-    contract.initialize(&treasury, &fee_bps);
+    let contract_id = env.register_contract(None, SkillSyncContract);
+    let contract = SkillSyncContractClient::new(&env, &contract_id);
+    contract.init(&admin, &fee_bps, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
 
     (
         env,
@@ -99,10 +99,10 @@ fn test_happy_path_create_complete_approve() {
     assert_eq!(token_client.balance(&contract_id), 1_000);
 
     // Complete session
-    contract.complete_session(&session_id);
+    contract.complete_session(&session_id, &seller, &0);
 
     // Approve session
-    contract.approve_session(&session_id);
+    contract.approve_session(&session_id, &buyer, &1);
 
     // Verify balances
     let session = contract.get_session(&session_id);
