@@ -11,7 +11,7 @@ pub use errors::ContractError;
 pub use events::{ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, TreasuryUpdated};
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, crypto, panic_with_error, token, Address, Bytes,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     Env, Symbol, Vec,
 };
 
@@ -647,13 +647,13 @@ impl SkillSyncContract {
 
         // Verify buyer signature
         let buyer_message = Self::create_approval_message(&env, &session_id, buyer_nonce);
-        if !crypto::ed25519::verify(&env, &session.payer, &buyer_message, &buyer_sig) {
+        if !env.crypto().ed25519_verify(session.payer.clone(), buyer_message, buyer_sig) {
             return Err(Error::InvalidSignature);
         }
 
         // Verify seller signature
         let seller_message = Self::create_approval_message(&env, &session_id, seller_nonce);
-        if !crypto::ed25519::verify(&env, &session.payee, &seller_message, &seller_sig) {
+        if !env.crypto().ed25519_verify(session.payee.clone(), seller_message, seller_sig) {
             return Err(Error::InvalidSignature);
         }
 
@@ -693,6 +693,69 @@ impl SkillSyncContract {
         Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
 
         // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "OffchainApprovalExecuted"),),
+            OffchainApprovalExecuted {
+                session_id,
+                buyer: session.payer,
+                seller: session.payee,
+                payout,
+                fee,
+                timestamp: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Approve a session by the buyer after completion.
+    /// This transfers funds to the seller and collects the platform fee.
+    pub fn approve_session(env: Env, session_id: Bytes, caller: Address, nonce: u64) -> Result<(), Error> {
+        use_nonce(&env, &caller, nonce)?;
+        caller.require_auth();
+
+        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+
+        if session.status != SessionStatus::Completed {
+            return Err(Error::InvalidSessionStatus);
+        }
+
+        if caller != session.payer {
+            return Err(Error::NotAuthorizedParty);
+        }
+
+        // Calculate fee and payout
+        let fee = session.amount
+            .checked_mul(session.fee_bps as i128)
+            .ok_or(Error::FeeCalculationOverflow)?
+            .checked_div(10000)
+            .ok_or(Error::FeeCalculationOverflow)?;
+        let payout = session.amount.checked_sub(fee).ok_or(Error::FeeCalculationOverflow)?;
+
+        // Transfer funds
+        let token_client = token::Client::new(&env, &session.asset);
+        let contract_id = env.current_contract_address();
+        let treasury = Self::get_treasury(env.clone());
+
+        if payout > 0 {
+            token_client.transfer(&contract_id, &session.payee, &payout);
+        }
+        if fee > 0 {
+            token_client.transfer(&contract_id, &treasury, &fee);
+        }
+
+        // Update session
+        let now = env.ledger().timestamp();
+        session.status = SessionStatus::Approved;
+        session.updated_at = now;
+        session.approved_at = now;
+
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &session);
+
+        Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
+
+        // Emit event (assuming there's a SessionApprovedEvent, but since it's not defined, I'll use OffchainApprovalExecuted for now)
         env.events().publish(
             (Symbol::new(&env, "OffchainApprovalExecuted"),),
             OffchainApprovalExecuted {
