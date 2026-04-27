@@ -320,6 +320,49 @@ impl SkillSyncContract {
         Ok(())
     }
 
+    pub fn create_session(
+        env: Env,
+        payer: Address,
+        payee: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<Bytes, Error> {
+        payer.require_auth();
+
+        let fee_bps = Self::get_platform_fee(env.clone());
+        let session_id = Self::generate_session_id(&env);
+
+        // Create session
+        let session = Session {
+            version: VERSION,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: asset.clone(),
+            amount,
+            fee_bps,
+            status: SessionStatus::Locked,
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
+            dispute_deadline: env.ledger().timestamp() + Self::get_dispute_window(env.clone()),
+            expires_at: env.ledger().timestamp() + ESCROW_DURATION_SECONDS,
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            dispute_opened_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+        };
+
+        Self::put_session(env.clone(), session)?;
+
+        // Lock funds
+        Self::lock_funds(env, session_id.clone(), payer, payee, asset, amount, fee_bps)?;
+
+        Ok(session_id)
+    }
+
     pub fn put_session(env: Env, session: Session) -> Result<(), Error> {
         let key = DataKey::Session(session.session_id.clone());
         if env.storage().persistent().has(&key) {
@@ -778,6 +821,16 @@ impl SkillSyncContract {
         message.extend_from_slice(&session_id.clone());
         message.extend_from_slice(&nonce.to_be_bytes());
         message
+    }
+
+    fn generate_session_id(env: &Env) -> Bytes {
+        let mut id = Bytes::new(env);
+        // Use ledger sequence and contract address for uniqueness
+        let seq = env.ledger().sequence();
+        id.extend_from_slice(&seq.to_be_bytes());
+        let contract_id = env.current_contract_address();
+        id.extend_from_slice(contract_id.as_bytes());
+        id
     }
 
     pub fn get_dispute_window(env: Env) -> u64 {
