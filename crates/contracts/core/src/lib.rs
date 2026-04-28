@@ -56,6 +56,8 @@ enum DataKey {
     ReentrancyLock,
     // Nonce for replay protection
     Nonce(Address),
+    // Emergency pause state
+    Paused,
     // Referrer fee configuration
     ReferrerFeeBps,
     // Referrer accumulated fees: ReferrerBalance(Address, Asset) -> i128
@@ -173,6 +175,22 @@ pub struct PlatformFeeUpdatedEvent {
     pub updated_by: Address,
 }
 
+/// Emitted when the contract is paused by admin.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PausedEvent {
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted when the contract is unpaused by admin.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct UnpausedEvent {
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 
 const VERSION: u32 = 1;
@@ -216,7 +234,8 @@ pub enum Error {
     InvalidNote = 33,            // Note too long
     AmountTooLarge = 34,         // Amount exceeds maximum allowed
     InvalidSignature = 35,       // Invalid cryptographic signature
-    Reentrancy = 35,             // Reentrant call detected
+    Reentrancy = 36,             // Reentrant call detected
+    ContractPaused = 37,         // Contract is paused
 }
 
 #[contractimpl]
@@ -266,6 +285,7 @@ impl SkillSyncContract {
     pub fn set_platform_fee(env: Env, new_fee_bps: u32) -> Result<(), Error> {
         let admin = read_admin(&env)?;
         admin.require_auth();
+        Self::require_not_paused(&env)?;
 
         validate_platform_fee_bps(new_fee_bps)?;
 
@@ -303,6 +323,7 @@ impl SkillSyncContract {
     pub fn set_treasury(env: Env, new_treasury: Address) -> Result<(), Error> {
         let admin = read_admin(&env)?;
         admin.require_auth();
+        Self::require_not_paused(&env)?;
 
         let old_treasury: Address = env
             .storage()
@@ -326,6 +347,60 @@ impl SkillSyncContract {
         Ok(())
     }
 
+    pub fn pause(env: Env) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        if Self::is_paused(env.clone()) {
+            return Ok(());
+        }
+
+        env.storage().persistent().set(&DataKey::Paused, &true);
+        env.events().publish(
+            (Symbol::new(&env, "Paused"),),
+            PausedEvent {
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+
+        if !Self::is_paused(env.clone()) {
+            return Ok(());
+        }
+
+        env.storage().persistent().set(&DataKey::Paused, &false);
+        env.events().publish(
+            (Symbol::new(&env, "Unpaused"),),
+            UnpausedEvent {
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        if env.storage().persistent().get(&DataKey::Paused).unwrap_or(false) {
+            return Err(Error::ContractPaused);
+        }
+        Ok(())
+    }
+
+    }
+
     pub fn create_session(
         env: Env,
         payer: Address,
@@ -333,6 +408,7 @@ impl SkillSyncContract {
         asset: Address,
         amount: i128,
     ) -> Result<Bytes, Error> {
+        Self::require_not_paused(&env)?;
         payer.require_auth();
 
         let fee_bps = Self::get_platform_fee(env.clone());
@@ -370,6 +446,7 @@ impl SkillSyncContract {
     }
 
     pub fn put_session(env: Env, session: Session) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         let key = DataKey::Session(session.session_id.clone());
         if env.storage().persistent().has(&key) {
             return Err(Error::DuplicateSessionId);
@@ -393,6 +470,7 @@ impl SkillSyncContract {
         amount: i128,
         _fee_bps: u32,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         acquire_lock(&env)?;
 
         validate_session_id(&session_id)?;
@@ -457,6 +535,7 @@ impl SkillSyncContract {
     }
 
     pub fn complete_session(env: Env, session_id: Bytes, caller: Address, nonce: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         use_nonce(&env, &caller, nonce)?;
         caller.require_auth();
 
@@ -486,6 +565,7 @@ impl SkillSyncContract {
     /// Emits AutoRefundExecutedEvent (closes issue #148) and
     /// SessionRefundedEvent (closes issue #147).
     pub fn auto_refund(env: Env, session_id: Bytes) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if session.status != SessionStatus::Completed {
@@ -550,6 +630,7 @@ impl SkillSyncContract {
     /// Open a dispute on a session.
     /// Emits DisputeOpenedEvent (closes issue #149).
     pub fn open_dispute(env: Env, session_id: Bytes, caller: Address, reason: Bytes) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         caller.require_auth();
 
         let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
@@ -592,6 +673,7 @@ impl SkillSyncContract {
         buyer_share: i128,
         seller_share: i128,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         let admin = read_admin(&env)?;
         admin.require_auth();
 
@@ -686,6 +768,7 @@ impl SkillSyncContract {
         buyer_sig: Bytes,
         seller_sig: Bytes,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         // Get the session
         let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
@@ -760,6 +843,7 @@ impl SkillSyncContract {
     /// Approve a session by the buyer after completion.
     /// This transfers funds to the seller and collects the platform fee.
     pub fn approve_session(env: Env, session_id: Bytes, caller: Address, nonce: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         use_nonce(&env, &caller, nonce)?;
         caller.require_auth();
 
