@@ -29,6 +29,7 @@ pub const DEFAULT_UPGRADE_TIMELOCK_SECONDS: u64 = 24 * 60 * 60; // Default 1 day
 pub const MAX_SESSION_ID_LEN: u32 = 64;      // Max session ID length
 pub const MAX_NOTE_LEN: u32 = 256;           // Max resolution note length
 pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100 trillion units max
+pub const MAX_EXTENSION_LEDGERS: u64 = 10_000; // Maximum extension duration in ledgers
 
 #[contract]
 pub struct SkillSyncContract;
@@ -125,6 +126,35 @@ pub struct Session {
     pub resolved_at: u64,
     pub resolver: Option<Address>,
     pub resolution_note: Option<Bytes>,
+    pub deadline: u64,
+    pub pending_extension: Option<PendingExtension>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingExtension {
+    pub proposer: Address,
+    pub additional_ledgers: u64,
+    pub proposed_at_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ExtensionProposedEvent {
+    pub session_id: Bytes,
+    pub proposer: Address,
+    pub additional_ledgers: u64,
+    pub proposed_at_ledger: u32,
+    pub deadline: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ExtensionAcceptedEvent {
+    pub session_id: Bytes,
+    pub accepter: Address,
+    pub new_deadline: u64,
+    pub accepted_at_ledger: u32,
     // Referrer for fee sharing
     pub referrer: Option<Address>,
 }
@@ -233,6 +263,12 @@ pub enum Error {
     InvalidSessionId = 32,       // Session ID empty or too long
     InvalidNote = 33,            // Note too long
     AmountTooLarge = 34,         // Amount exceeds maximum allowed
+    InvalidExtensionDuration = 35, // Extension duration invalid or exceeds maximum
+    ExtensionAlreadyProposed = 36, // An extension is already pending for this session
+    ExtensionNotProposed = 37,   // No extension has been proposed
+    CannotAcceptOwnExtension = 38, // The proposer cannot accept their own extension
+    InvalidSignature = 39,       // Invalid cryptographic signature
+    Reentrancy = 40,             // Reentrant call detected
     InvalidSignature = 35,       // Invalid cryptographic signature
     Reentrancy = 36,             // Reentrant call detected
     ContractPaused = 37,         // Contract is paused
@@ -414,32 +450,7 @@ impl SkillSyncContract {
         let fee_bps = Self::get_platform_fee(env.clone());
         let session_id = Self::generate_session_id(&env);
 
-        // Create session
-        let session = Session {
-            version: VERSION,
-            session_id: session_id.clone(),
-            payer: payer.clone(),
-            payee: payee.clone(),
-            asset: asset.clone(),
-            amount,
-            fee_bps,
-            status: SessionStatus::Locked,
-            created_at: env.ledger().timestamp(),
-            updated_at: env.ledger().timestamp(),
-            dispute_deadline: env.ledger().timestamp() + Self::get_dispute_window(env.clone()),
-            expires_at: env.ledger().timestamp() + ESCROW_DURATION_SECONDS,
-            payer_approved: false,
-            payee_approved: false,
-            approved_at: 0,
-            dispute_opened_at: 0,
-            resolved_at: 0,
-            resolver: None,
-            resolution_note: None,
-        };
-
-        Self::put_session(env.clone(), session)?;
-
-        // Lock funds
+        // Lock funds, create the session record, and return the generated ID.
         Self::lock_funds(env, session_id.clone(), payer, payee, asset, amount, fee_bps)?;
 
         Ok(session_id)
@@ -498,7 +509,7 @@ impl SkillSyncContract {
         }
 
         let session = Session {
-            version: 1,
+            version: VERSION,
             session_id: session_id.clone(),
             payer: payer.clone(),
             payee: payee.clone(),
@@ -510,6 +521,7 @@ impl SkillSyncContract {
             updated_at: now,
             dispute_deadline,
             expires_at,
+            deadline: env.ledger().sequence(),
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -517,6 +529,7 @@ impl SkillSyncContract {
             resolved_at: 0,
             resolver: None,
             resolution_note: None,
+            pending_extension: None,
         };
 
         Self::put_session(env.clone(), session)?;
@@ -900,6 +913,97 @@ impl SkillSyncContract {
                 payout,
                 fee,
                 timestamp: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn propose_extension(
+        env: Env,
+        session_id: Bytes,
+        caller: Address,
+        additional_ledgers: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        if session.status != SessionStatus::Locked {
+            return Err(Error::InvalidSessionStatus);
+        }
+
+        if caller != session.payer && caller != session.payee {
+            return Err(Error::NotAuthorizedParty);
+        }
+
+        if session.pending_extension.is_some() {
+            return Err(Error::ExtensionAlreadyProposed);
+        }
+
+        if additional_ledgers == 0 || additional_ledgers > MAX_EXTENSION_LEDGERS {
+            return Err(Error::InvalidExtensionDuration);
+        }
+
+        let proposed_at_ledger = env.ledger().sequence();
+        session.pending_extension = Some(PendingExtension {
+            proposer: caller.clone(),
+            additional_ledgers,
+            proposed_at_ledger,
+        });
+        session.updated_at = env.ledger().timestamp();
+
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &session);
+
+        env.events().publish(
+            (Symbol::new(&env, "ExtensionProposed"),),
+            ExtensionProposedEvent {
+                session_id: session_id.clone(),
+                proposer: caller,
+                additional_ledgers,
+                proposed_at_ledger,
+                deadline: session.deadline,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn accept_extension(env: Env, session_id: Bytes, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        if session.status != SessionStatus::Locked {
+            return Err(Error::InvalidSessionStatus);
+        }
+
+        if caller != session.payer && caller != session.payee {
+            return Err(Error::NotAuthorizedParty);
+        }
+
+        let pending = session.pending_extension.ok_or(Error::ExtensionNotProposed)?;
+        if pending.proposer == caller {
+            return Err(Error::CannotAcceptOwnExtension);
+        }
+
+        session.deadline = session
+            .deadline
+            .checked_add(pending.additional_ledgers)
+            .ok_or(Error::InvalidExtensionDuration)?;
+        let accepted_at_ledger = env.ledger().sequence();
+        session.pending_extension = None;
+        session.updated_at = env.ledger().timestamp();
+
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &session);
+
+        env.events().publish(
+            (Symbol::new(&env, "ExtensionAccepted"),),
+            ExtensionAcceptedEvent {
+                session_id: session_id.clone(),
+                accepter: caller,
+                new_deadline: session.deadline,
+                accepted_at_ledger,
             },
         );
 
