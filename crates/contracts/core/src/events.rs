@@ -92,3 +92,18 @@ pub struct SessionApprovedEvent {
     /// Ledger timestamp at the moment of approval.
     pub timestamp: u64,
 }
+
+/// Emitted when a referrer claims accumulated fees.
+/// Shows the amount claimed and the asset.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ReferrerFeePaid {
+    /// Address of the referrer claiming fees.
+    pub referrer: Address,
+    /// Asset address of the fees claimed.
+    pub asset: Address,
+    /// Amount of fees claimed.
+    pub amount: i128,
+    /// Ledger timestamp at the moment of claim.
+    pub timestamp: u64,
+}
