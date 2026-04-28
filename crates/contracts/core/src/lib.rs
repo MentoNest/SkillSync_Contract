@@ -8,7 +8,7 @@ pub mod events;
 pub mod oracle;
 
 pub use errors::ContractError;
-pub use events::{ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, SessionApprovedEvent, TreasuryUpdated};
+pub use events::{ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, ReferrerFeePaid, SessionApprovedEvent, TreasuryUpdated};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
@@ -57,6 +57,10 @@ enum DataKey {
     ReentrancyLock,
     // Nonce for replay protection
     Nonce(Address),
+    // Referrer fee configuration
+    ReferrerFeeBps,
+    // Referrer accumulated fees: ReferrerBalance(Address, Asset) -> i128
+    ReferrerBalance(Address, Address),
 }
 
 #[contracttype]
@@ -149,6 +153,8 @@ pub struct ExtensionAcceptedEvent {
     pub accepter: Address,
     pub new_deadline: u64,
     pub accepted_at_ledger: u32,
+    // Referrer for fee sharing
+    pub referrer: Option<Address>,
 }
 
 // ── Event structs ────────────────────────────────────────────────────────────
