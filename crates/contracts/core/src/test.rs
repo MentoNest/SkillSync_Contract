@@ -30,9 +30,49 @@ fn setup() -> (
     Address,
     Address,
     Address,
-    Address,
 ) {
     setup_with_fee(500) // Default 5% fee
+}
+
+fn setup_with_admin() -> (
+    Env,
+    CoreContractClient<'static>,
+    TokenClient<'static>,
+    StellarAssetClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token_client = TokenClient::new(&env, &token_address);
+    let asset_client = StellarAssetClient::new(&env, &token_address);
+
+    let contract_id = env.register_contract(None, SkillSyncContract);
+    let contract = SkillSyncContractClient::new(&env, &contract_id);
+    contract.init(&admin, &500, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+    (
+        env,
+        contract,
+        token_client,
+        asset_client,
+        buyer,
+        seller,
+        treasury,
+        contract_id,
+        admin,
+    )
 }
 
 fn setup_with_fee(fee_bps: u32) -> (
@@ -117,6 +157,31 @@ fn test_happy_path_create_complete_approve() {
     let last_event = events.last().unwrap();
     assert_eq!(last_event.0, contract_id);
     assert!(std::format!("{:?}", last_event.1).contains("approved"));
+}
+
+#[test]
+fn test_pause_blocks_state_changes_but_allows_view() {
+    let (env, contract, token_client, asset_client, buyer, seller, treasury, contract_id, _admin) = setup_with_admin();
+
+    mint_and_approve(&asset_client, &buyer, 1_000);
+    contract.pause().unwrap();
+    assert!(contract.is_paused());
+    assert_eq!(contract.get_platform_fee(), 500);
+
+    let result = env.try_invoke_contract(
+        &contract_id,
+        &"create_session",
+        buyer.clone().into_val(&env),
+        seller.clone().into_val(&env),
+        token_client.address.into_val(&env),
+        (1_000_i128).into_val(&env),
+    );
+    assert!(result.is_err());
+
+    contract.unpause().unwrap();
+    let session_id = contract.create_session(&buyer, &seller, &token_client.address, &1_000);
+    assert_eq!(token_client.balance(&contract_id), 1_000);
+    assert!(!contract.is_paused());
 }
 
 // ============================================================================
