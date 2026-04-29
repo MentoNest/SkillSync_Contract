@@ -1,6 +1,6 @@
 use soroban_sdk::{contracttype, Address, Bytes, Env};
 
-use crate::errors::ContractError;
+use crate::Error;
 
 /// Price data returned by the oracle.
 #[contracttype]
@@ -75,8 +75,8 @@ pub fn set_fallback_price(env: &Env, admin: &Address, asset: Bytes, price: i128)
 /// Strategy:
 /// 1. Try the on-chain oracle (if configured) and validate freshness.
 /// 2. Fall back to the admin-provided price if the oracle is unavailable or stale.
-/// 3. Return `ContractError::InternalError` if neither source is available.
-pub fn get_price(env: &Env, asset: Bytes) -> Result<i128, ContractError> {
+/// 3. Return `Error::InternalError` if neither source is available.
+pub fn get_price(env: &Env, asset: Bytes) -> Result<i128, Error> {
     let now = env.ledger().timestamp();
     let threshold = get_freshness_threshold(env);
 
@@ -97,7 +97,7 @@ pub fn get_price(env: &Env, asset: Bytes) -> Result<i128, ContractError> {
         return Ok(data.price);
     }
 
-    Err(ContractError::InternalError)
+    Err(Error::TransferError)
 }
 
 /// Validate that a price timestamp is within the freshness threshold.
@@ -105,9 +105,9 @@ pub fn validate_price_freshness(
     now: u64,
     price_timestamp: u64,
     threshold_secs: u64,
-) -> Result<(), ContractError> {
+) -> Result<(), Error> {
     if now.saturating_sub(price_timestamp) > threshold_secs {
-        return Err(ContractError::InternalError); // stale price
+        return Err(Error::TransferError); // stale price
     }
     Ok(())
 }

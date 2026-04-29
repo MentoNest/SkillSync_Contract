@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::{SkillSyncContract, SkillSyncContractClient, DEFAULT_DISPUTE_WINDOW_SECONDS};
+use crate::{SkillSyncContract, SkillSyncContractClient, DEFAULT_DISPUTE_WINDOW_SECONDS, DEFAULT_DISPUTE_WINDOW_LEDGERS, DISPUTE_WINDOW_MIN_LEDGERS, DISPUTE_WINDOW_MAX_LEDGERS};
 use soroban_sdk::{symbol_short, testutils::Address as _, vec, Address, BytesN, Env};
 extern crate std;
 
@@ -60,7 +60,7 @@ fn setup_with_admin() -> (
 
     let contract_id = env.register_contract(None, SkillSyncContract);
     let contract = SkillSyncContractClient::new(&env, &contract_id);
-    contract.init(&admin, &500, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+    contract.init(&admin, &500, &treasury, &DEFAULT_DISPUTE_WINDOW_LEDGERS);
 
     (
         env,
@@ -100,7 +100,7 @@ fn setup_with_fee(fee_bps: u32) -> (
 
     let contract_id = env.register_contract(None, SkillSyncContract);
     let contract = SkillSyncContractClient::new(&env, &contract_id);
-    contract.init(&admin, &fee_bps, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+    contract.init(&admin, &fee_bps, &treasury, &DEFAULT_DISPUTE_WINDOW_LEDGERS);
 
     (
         env,
@@ -679,7 +679,7 @@ fn setup_env() -> (Env, SkillSyncContractClient, Address, Address) {
     let client = SkillSyncContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
     let treasury = Address::generate(&env);
-    client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+    client.init(&admin, &100, &treasury, &DEFAULT_DISPUTE_WINDOW_LEDGERS);
     (env, client, admin, treasury)
 }
 
@@ -720,11 +720,11 @@ fn test_auto_refund_success() {
     let result = client.try_auto_refund(&session_id);
     assert!(result.is_err());
 
-    // 4. Advance ledger time beyond dispute window
+    // 4. Advance ledger sequence beyond dispute window
     env.ledger().set(LedgerInfo {
-        timestamp: env.ledger().timestamp() + DEFAULT_DISPUTE_WINDOW_SECONDS + 1,
+        timestamp: env.ledger().timestamp() + 10000, // Advance time as well
         protocol_version: 20,
-        sequence_number: 100,
+        sequence_number: DEFAULT_DISPUTE_WINDOW_LEDGERS + 100,
         network_id: [0u8; 32],
         base_reserve: 100,
         min_temp_entry_ttl: 1,
@@ -758,11 +758,11 @@ fn test_auto_refund_fails_if_not_completed() {
     let session_id = Bytes::from_slice(&env, b"session_locked");
     client.lock_funds(&session_id, &payer, &payee, &token_id, &amount, &0);
 
-    // Advance time
+    // Advance ledger sequence beyond dispute window
     env.ledger().set(LedgerInfo {
-        timestamp: env.ledger().timestamp() + DEFAULT_DISPUTE_WINDOW_SECONDS + 1,
+        timestamp: env.ledger().timestamp() + 10000, // Advance time as well
         protocol_version: 20,
-        sequence_number: 100,
+        sequence_number: DEFAULT_DISPUTE_WINDOW_LEDGERS + 100,
         network_id: [0u8; 32],
         base_reserve: 100,
         min_temp_entry_ttl: 1,
@@ -1415,4 +1415,121 @@ fn funds_locked_event_emitted() {
         std::format!("{:?}", e.1).contains("locked")
     }).unwrap();
     assert_eq!(locked_event.0, contract_id);
+}
+
+// ============================================================================
+// Test: Dispute Window Configuration
+// ============================================================================
+
+#[test]
+fn test_get_dispute_window_returns_default() {
+    let (env, contract, _, _, _, _, _, _, _) = setup_with_admin();
+    
+    // Should return default value of 1000 ledgers
+    let window = contract.get_dispute_window();
+    assert_eq!(window, DEFAULT_DISPUTE_WINDOW_LEDGERS);
+}
+
+#[test]
+fn test_set_dispute_window_updates_value() {
+    let (env, contract, _, _, _, _, _, _, admin) = setup_with_admin();
+    
+    // Set new dispute window
+    let new_window: u32 = 2000;
+    contract.set_dispute_window(&new_window);
+    
+    // Verify it was updated
+    let window = contract.get_dispute_window();
+    assert_eq!(window, new_window);
+}
+
+#[test]
+fn test_set_dispute_window_emits_event() {
+    let (env, contract, _, _, _, _, _, _, admin) = setup_with_admin();
+    
+    let old_window = contract.get_dispute_window();
+    let new_window: u32 = 1500;
+    
+    contract.set_dispute_window(&new_window);
+    
+    // Check that DisputeWindowUpdated event was emitted
+    let events = env.events().all();
+    let event = events.iter().find(|e| {
+        std::format!("{:?}", e.1).contains("DisputeWindowUpdated")
+    });
+    
+    assert!(event.is_some(), "DisputeWindowUpdated event should be emitted");
+}
+
+#[test]
+#[should_panic(expected = "InvalidDisputeWindow")]
+fn test_set_dispute_window_rejects_too_small() {
+    let (env, contract, _, _, _, _, _, _, admin) = setup_with_admin();
+    
+    // Try to set window below minimum (10 ledgers)
+    let invalid_window: u32 = 5;
+    contract.set_dispute_window(&invalid_window);
+}
+
+#[test]
+#[should_panic(expected = "InvalidDisputeWindow")]
+fn test_set_dispute_window_rejects_too_large() {
+    let (env, contract, _, _, _, _, _, _, admin) = setup_with_admin();
+    
+    // Try to set window above maximum (100,000 ledgers)
+    let invalid_window: u32 = 150_000;
+    contract.set_dispute_window(&invalid_window);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_set_dispute_window_requires_admin() {
+    let (env, contract, _, _, buyer, _, _, _, admin) = setup_with_admin();
+    
+    // Try to set dispute window as non-admin (should fail)
+    env.mock_all_auths_allowing_non_root_auth();
+    let new_window: u32 = 2000;
+    
+    // This should panic because buyer is not admin
+    contract.set_dispute_window(&new_window);
+}
+
+#[test]
+fn test_set_dispute_window_accepts_minimum_value() {
+    let (env, contract, _, _, _, _, _, _, admin) = setup_with_admin();
+    
+    // Set to minimum allowed value
+    let min_window: u32 = DISPUTE_WINDOW_MIN_LEDGERS;
+    contract.set_dispute_window(&min_window);
+    
+    let window = contract.get_dispute_window();
+    assert_eq!(window, min_window);
+}
+
+#[test]
+fn test_set_dispute_window_accepts_maximum_value() {
+    let (env, contract, _, _, _, _, _, _, admin) = setup_with_admin();
+    
+    // Set to maximum allowed value
+    let max_window: u32 = DISPUTE_WINDOW_MAX_LEDGERS;
+    contract.set_dispute_window(&max_window);
+    
+    let window = contract.get_dispute_window();
+    assert_eq!(window, max_window);
+}
+
+#[test]
+fn test_dispute_window_persists_across_calls() {
+    let (env, contract, _, _, _, _, _, _, admin) = setup_with_admin();
+    
+    // Set dispute window
+    let new_window: u32 = 3000;
+    contract.set_dispute_window(&new_window);
+    
+    // Verify it persists
+    let window1 = contract.get_dispute_window();
+    let window2 = contract.get_dispute_window();
+    
+    assert_eq!(window1, new_window);
+    assert_eq!(window2, new_window);
 }
