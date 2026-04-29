@@ -151,7 +151,9 @@ impl SkillSyncContract {
 
         let fee_bps = Self::get_platform_fee(env.clone());
         let now = env.ledger().timestamp();
-        let dispute_window = Self::get_dispute_window(env.clone());
+        let dispute_window_ledgers = Self::get_dispute_window(env.clone());
+        let current_ledger = env.ledger().sequence();
+        let dispute_deadline = (current_ledger + dispute_window_ledgers) as u64;
 
         let platform_fee = amount
             .checked_mul(fee_bps as i128)
@@ -189,7 +191,7 @@ impl SkillSyncContract {
             status: SessionStatus::Locked,
             created_at: now,
             updated_at: now,
-            dispute_deadline: now + dispute_window,
+            dispute_deadline,
             expires_at: now + crate::ESCROW_DURATION_SECONDS,
             deadline: env.ledger().sequence() as u64,
             payer_approved: false,

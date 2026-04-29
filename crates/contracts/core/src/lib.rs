@@ -1,5 +1,4 @@
 #![no_std]
-#![no_std]
 
 pub mod conditional_escrow;
 pub mod dao_dispute;
@@ -8,16 +7,13 @@ pub mod storage_archive;
 
 pub mod error_codes;
 
-pub use error_codes::{
-    AuthError, FinancialError, InitError, SessionError, TimeoutDisputeError, UpgradeError,
-};
 pub use error_codes::{AuthError, FinancialError, InitError, ReentrancyError, SessionError, TimeoutDisputeError, UpgradeError};
-pub mod errors;
+// pub mod errors;  // Not used - using Error enum in lib.rs instead
 pub mod events;
 pub mod oracle;
 
 pub use events::{
-    ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, ReferrerFeePaid,
+    ContractUpgraded, DisputeResolved, DisputeWindowUpdated, OffchainApprovalExecuted, ReferrerFeePaid,
     SessionApprovedEvent, TreasuryUpdated,
 };
 
@@ -29,6 +25,9 @@ use soroban_sdk::{
 pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
 pub const DISPUTE_WINDOW_MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_DISPUTE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+pub const DEFAULT_DISPUTE_WINDOW_LEDGERS: u32 = 1000; // Default 1000 ledgers
+pub const DISPUTE_WINDOW_MIN_LEDGERS: u32 = 10; // Minimum 10 ledgers
+pub const DISPUTE_WINDOW_MAX_LEDGERS: u32 = 100_000; // Maximum 100,000 ledgers
 pub const PLATFORM_FEE_MAX_BPS: u32 = 1000; // 10%
 pub const MAX_FEE_BPS: u32 = 10_000; // 100% - absolute maximum
 pub const ESCROW_DURATION_SECONDS: u64 = 7 * 24 * 60 * 60; // Default 7 days
@@ -345,43 +344,13 @@ pub enum Error {
     ExtensionNotProposed = 37,     // No extension has been proposed
     CannotAcceptOwnExtension = 38, // The proposer cannot accept their own extension
     InvalidSignature = 39,         // Invalid cryptographic signature
-    Reentrancy = 40,               // Reentrant call detected
+    Reentrancy = 40,               // Reentrant call detected (Issue #209)
     ContractPaused = 41,           // Contract is paused
-    SessionNotExpired = 16,
-    RefundFailed = 17,
-    NothingToSweep = 18,
-    UpgradeNotProposed = 19,
-    UpgradeNotReady = 20,
-    UpgradeDeadlinePassed = 21,
-    InvalidTimelock = 22,
-    InvalidResolutionAmount = 23,
-    SessionNotDisputed = 24,
-    ResolutionFeeError = 25,
-    FeeCalculationOverflow = 26,
-    NonceAlreadyUsed = 27,
-    InvalidRating = 28,
-    ReputationOverflow = 29,
-    InvalidDisputeState = 30,
-    InvalidAddress = 31,
-    InvalidSessionId = 32,
-    InvalidNote = 33,
-    AmountTooLarge = 34,
-    InvalidExtensionDuration = 35,
-    ExtensionAlreadyProposed = 36,
-    ExtensionNotProposed = 37,
-    CannotAcceptOwnExtension = 38,
-    InvalidSignature = 39,
-    // Issue #209: Reentrancy detected (code 700 per spec, mapped here as 40)
-    Reentrancy = 40,
-    ContractPaused = 41,
-    // Issue #208: Session expired
-    SessionExpired = 42,
-    // Issue #210: Milestone errors
-    InvalidMilestones = 43,
+    SessionExpired = 42,           // Session expired (Issue #208)
+    InvalidMilestones = 43,        // Issue #210: Milestone errors
     MilestoneAlreadyReleased = 44,
     MilestoneIndexOutOfBounds = 45,
-    // Issue #211: Rating errors
-    AlreadyRated = 46,
+    AlreadyRated = 46,             // Issue #211: Rating errors
     SessionNotApproved = 47,
 }
 
@@ -392,14 +361,14 @@ impl SkillSyncContract {
         admin: Address,
         platform_fee_bps: u32,
         treasury_address: Address,
-        dispute_window_secs: u64,
+        dispute_window_ledgers: u32,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
 
         validate_platform_fee_bps(platform_fee_bps)?;
-        validate_dispute_window(dispute_window_secs)?;
+        validate_dispute_window_ledgers(dispute_window_ledgers)?;
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -410,7 +379,7 @@ impl SkillSyncContract {
             .set(&DataKey::Treasury, &treasury_address);
         env.storage()
             .instance()
-            .set(&DataKey::DisputeWindow, &dispute_window_secs);
+            .set(&DataKey::DisputeWindow, &dispute_window_ledgers);
         env.storage().instance().set(&DataKey::Version, &VERSION);
 
         env.events().publish(
@@ -419,7 +388,7 @@ impl SkillSyncContract {
                 admin,
                 platform_fee_bps,
                 treasury_address,
-                dispute_window_secs,
+                dispute_window_ledgers,
                 VERSION,
             ),
         );
@@ -613,8 +582,9 @@ impl SkillSyncContract {
         validate_different_addresses(&payer, &payee)?;
 
         let now = env.ledger().timestamp();
-        let dispute_window = Self::get_dispute_window(env.clone());
-        let dispute_deadline = now + dispute_window;
+        let dispute_window_ledgers = Self::get_dispute_window(env.clone());
+        let current_ledger = env.ledger().sequence();
+        let dispute_deadline = (current_ledger + dispute_window_ledgers) as u64;
         let expires_at = now + ESCROW_DURATION_SECONDS;
         let fee_bps = Self::get_platform_fee(env.clone());
 
@@ -645,7 +615,6 @@ impl SkillSyncContract {
             updated_at: now,
             dispute_deadline,
             expires_at,
-            deadline: env.ledger().sequence() as u64,
             deadline: (env.ledger().sequence() as u64) + (Self::get_max_session_duration(env.clone()) as u64),
             payer_approved: false,
             payee_approved: false,
@@ -723,9 +692,10 @@ impl SkillSyncContract {
         }
 
         let now = env.ledger().timestamp();
-        let dispute_window = Self::get_dispute_window(env.clone());
+        let current_ledger = env.ledger().sequence();
 
-        if now <= session.updated_at + dispute_window {
+        // Check if dispute window has elapsed (using ledger-based deadline)
+        if current_ledger <= session.dispute_deadline as u32 {
             return Err(Error::DisputeWindowNotElapsed);
         }
 
@@ -1200,11 +1170,49 @@ impl SkillSyncContract {
         id
     }
 
-    pub fn get_dispute_window(env: Env) -> u64 {
+    pub fn get_dispute_window(env: Env) -> u32 {
         env.storage()
             .instance()
             .get(&DataKey::DisputeWindow)
-            .unwrap_or(DEFAULT_DISPUTE_WINDOW_SECONDS)
+            .unwrap_or(DEFAULT_DISPUTE_WINDOW_LEDGERS)
+    }
+
+    /// Set the dispute resolution window in ledgers. Only callable by admin.
+    /// Emits DisputeWindowUpdated event.
+    pub fn set_dispute_window(env: Env, window_ledgers: u32) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+        Self::require_not_paused(&env)?;
+
+        // Validate the window is within acceptable range
+        if window_ledgers < DISPUTE_WINDOW_MIN_LEDGERS || window_ledgers > DISPUTE_WINDOW_MAX_LEDGERS {
+            return Err(Error::InvalidDisputeWindow);
+        }
+
+        // Get the old value for the event
+        let old_window_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeWindow)
+            .unwrap_or(DEFAULT_DISPUTE_WINDOW_LEDGERS);
+
+        // Store the new value
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeWindow, &window_ledgers);
+
+        // Emit the event
+        env.events().publish(
+            (Symbol::new(&env, "DisputeWindowUpdated"),),
+            DisputeWindowUpdated {
+                old_window_ledgers,
+                new_window_ledgers: window_ledgers,
+                updated_by: admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
     }
 
     pub fn get_treasury(env: Env) -> Address {
@@ -1375,7 +1383,9 @@ impl SkillSyncContract {
         payer.require_auth();
 
         let now = env.ledger().timestamp();
-        let dispute_window = Self::get_dispute_window(env.clone());
+        let dispute_window_ledgers = Self::get_dispute_window(env.clone());
+        let current_ledger = env.ledger().sequence();
+        let dispute_deadline = (current_ledger + dispute_window_ledgers) as u64;
         let fee_bps = Self::get_platform_fee(env.clone());
         let max_duration = Self::get_max_session_duration(env.clone());
 
@@ -1414,7 +1424,7 @@ impl SkillSyncContract {
             status: SessionStatus::Locked,
             created_at: now,
             updated_at: now,
-            dispute_deadline: now + dispute_window,
+            dispute_deadline,
             expires_at: now + ESCROW_DURATION_SECONDS,
             deadline: (env.ledger().sequence() as u64) + (max_duration as u64),
             payer_approved: false,
@@ -1636,9 +1646,6 @@ fn acquire_lock(env: &Env) -> Result<(), Error> {
         .unwrap_or(false)
     {
         return Err(Error::Reentrancy);
-    if env.storage().instance().get(&DataKey::ReentrancyLock).unwrap_or(false) {
-        // Issue #209: ReentrancyDetected error code 700
-        panic_with_error!(env, ReentrancyError::ReentrancyDetected);
     }
     env.storage()
         .instance()
@@ -1664,6 +1671,13 @@ fn use_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), Error> {
 
 fn validate_dispute_window(seconds: u64) -> Result<(), Error> {
     if !(DISPUTE_WINDOW_MIN_SECONDS..=DISPUTE_WINDOW_MAX_SECONDS).contains(&seconds) {
+        return Err(Error::InvalidDisputeWindow);
+    }
+    Ok(())
+}
+
+fn validate_dispute_window_ledgers(ledgers: u32) -> Result<(), Error> {
+    if ledgers < DISPUTE_WINDOW_MIN_LEDGERS || ledgers > DISPUTE_WINDOW_MAX_LEDGERS {
         return Err(Error::InvalidDisputeWindow);
     }
     Ok(())
@@ -1711,4 +1725,3 @@ mod test;
 
 #[cfg(test)]
 mod test_storage_persistence;
-

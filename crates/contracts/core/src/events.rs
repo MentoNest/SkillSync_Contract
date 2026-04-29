@@ -107,3 +107,18 @@ pub struct ReferrerFeePaid {
     /// Ledger timestamp at the moment of claim.
     pub timestamp: u64,
 }
+
+/// Emitted when the admin updates the dispute resolution window.
+/// Shows the old and new window values in ledgers.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DisputeWindowUpdated {
+    /// Previous dispute window value in ledgers.
+    pub old_window_ledgers: u32,
+    /// New dispute window value in ledgers.
+    pub new_window_ledgers: u32,
+    /// Address of the admin who performed the update.
+    pub updated_by: Address,
+    /// Ledger timestamp at the moment of the update.
+    pub timestamp: u64,
+}
