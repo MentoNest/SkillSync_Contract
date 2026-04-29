@@ -37,9 +37,7 @@ pub fn set_oracle(env: &Env, admin: &Address, oracle_id: Address) {
 
 /// Get the configured oracle address, if any.
 pub fn get_oracle(env: &Env) -> Option<Address> {
-    env.storage()
-        .instance()
-        .get(&OracleKey::OracleAddress)
+    env.storage().instance().get(&OracleKey::OracleAddress)
 }
 
 /// Set the freshness threshold (seconds). Admin-only.
@@ -75,7 +73,7 @@ pub fn set_fallback_price(env: &Env, admin: &Address, asset: Bytes, price: i128)
 /// Strategy:
 /// 1. Try the on-chain oracle (if configured) and validate freshness.
 /// 2. Fall back to the admin-provided price if the oracle is unavailable or stale.
-/// 3. Return `Error::InternalError` if neither source is available.
+/// 3. Return `Error::SessionNotFound` if neither source is available.
 pub fn get_price(env: &Env, asset: Bytes) -> Result<i128, Error> {
     let now = env.ledger().timestamp();
     let threshold = get_freshness_threshold(env);
@@ -97,7 +95,7 @@ pub fn get_price(env: &Env, asset: Bytes) -> Result<i128, Error> {
         return Ok(data.price);
     }
 
-    Err(Error::TransferError)
+    Err(Error::SessionNotFound)
 }
 
 /// Validate that a price timestamp is within the freshness threshold.
@@ -107,7 +105,7 @@ pub fn validate_price_freshness(
     threshold_secs: u64,
 ) -> Result<(), Error> {
     if now.saturating_sub(price_timestamp) > threshold_secs {
-        return Err(Error::TransferError); // stale price
+        return Err(Error::SessionNotFound); // stale price
     }
     Ok(())
 }
