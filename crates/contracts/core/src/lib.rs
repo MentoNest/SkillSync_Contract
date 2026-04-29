@@ -1,18 +1,26 @@
 #![no_std]
 
+pub mod conditional_escrow;
+pub mod dao_dispute;
+pub mod insurance;
+pub mod storage_archive;
+
 pub mod error_codes;
 
-pub use error_codes::{AuthError, FinancialError, InitError, SessionError, TimeoutDisputeError, UpgradeError};
-pub mod errors;
+pub use error_codes::{
+    AuthError, FinancialError, InitError, SessionError, TimeoutDisputeError, UpgradeError,
+};
 pub mod events;
 pub mod oracle;
 
-pub use errors::ContractError;
-pub use events::{ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, ReferrerFeePaid, SessionApprovedEvent, TreasuryUpdated};
+pub use events::{
+    ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, ReferrerFeePaid,
+    SessionApprovedEvent, TreasuryUpdated,
+};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
-    Env, Symbol, Vec,
+    BytesN, Env, Symbol, Vec,
 };
 
 pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
@@ -26,8 +34,8 @@ pub const MIN_UPGRADE_TIMELOCK_SECONDS: u64 = 60; // Minimum 1 minute timelock
 pub const DEFAULT_UPGRADE_TIMELOCK_SECONDS: u64 = 24 * 60 * 60; // Default 1 day timelock
 
 // Input validation limits
-pub const MAX_SESSION_ID_LEN: u32 = 64;      // Max session ID length
-pub const MAX_NOTE_LEN: u32 = 256;           // Max resolution note length
+pub const MAX_SESSION_ID_LEN: u32 = 64; // Max session ID length
+pub const MAX_NOTE_LEN: u32 = 256; // Max resolution note length
 pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100 trillion units max
 pub const MAX_EXTENSION_LEDGERS: u64 = 10_000; // Maximum extension duration in ledgers
 
@@ -244,34 +252,32 @@ pub enum Error {
     NotAuthorizedParty = 13,
     AlreadyApproved = 14,
     InvalidSessionStatus = 15,
-    SessionNotExpired = 16,     // Session has not yet expired
-    RefundFailed = 17,          // Failed to refund escrow
-    NothingToSweep = 18,        // No expired sessions to sweep
-    UpgradeNotProposed = 19,    // No upgrade has been proposed
-    UpgradeNotReady = 20,       // Upgrade timelock has not elapsed
-    UpgradeDeadlinePassed = 21, // Upgrade deadline has passed
-    InvalidTimelock = 22,       // Invalid timelock duration
-    InvalidResolutionAmount = 23, // Resolution amounts don't sum to available amount
-    SessionNotDisputed = 24,     // Session is not in Disputed status
-    ResolutionFeeError = 25,     // Error calculating resolution fees
-    FeeCalculationOverflow = 26, // Fee calculation overflow/underflow
-    NonceAlreadyUsed = 27,       // Nonce already used for replay protection
-    InvalidRating = 28,          // Rating value is invalid (must be 1-5)
-    ReputationOverflow = 29,     // Reputation calculation overflow
-    InvalidDisputeState = 30,    // Session is not in a valid state for dispute
-    InvalidAddress = 31,         // Invalid or empty address
-    InvalidSessionId = 32,       // Session ID empty or too long
-    InvalidNote = 33,            // Note too long
-    AmountTooLarge = 34,         // Amount exceeds maximum allowed
+    SessionNotExpired = 16,        // Session has not yet expired
+    RefundFailed = 17,             // Failed to refund escrow
+    NothingToSweep = 18,           // No expired sessions to sweep
+    UpgradeNotProposed = 19,       // No upgrade has been proposed
+    UpgradeNotReady = 20,          // Upgrade timelock has not elapsed
+    UpgradeDeadlinePassed = 21,    // Upgrade deadline has passed
+    InvalidTimelock = 22,          // Invalid timelock duration
+    InvalidResolutionAmount = 23,  // Resolution amounts don't sum to available amount
+    SessionNotDisputed = 24,       // Session is not in Disputed status
+    ResolutionFeeError = 25,       // Error calculating resolution fees
+    FeeCalculationOverflow = 26,   // Fee calculation overflow/underflow
+    NonceAlreadyUsed = 27,         // Nonce already used for replay protection
+    InvalidRating = 28,            // Rating value is invalid (must be 1-5)
+    ReputationOverflow = 29,       // Reputation calculation overflow
+    InvalidDisputeState = 30,      // Session is not in a valid state for dispute
+    InvalidAddress = 31,           // Invalid or empty address
+    InvalidSessionId = 32,         // Session ID empty or too long
+    InvalidNote = 33,              // Note too long
+    AmountTooLarge = 34,           // Amount exceeds maximum allowed
     InvalidExtensionDuration = 35, // Extension duration invalid or exceeds maximum
     ExtensionAlreadyProposed = 36, // An extension is already pending for this session
-    ExtensionNotProposed = 37,   // No extension has been proposed
+    ExtensionNotProposed = 37,     // No extension has been proposed
     CannotAcceptOwnExtension = 38, // The proposer cannot accept their own extension
-    InvalidSignature = 39,       // Invalid cryptographic signature
-    Reentrancy = 40,             // Reentrant call detected
-    InvalidSignature = 35,       // Invalid cryptographic signature
-    Reentrancy = 36,             // Reentrant call detected
-    ContractPaused = 37,         // Contract is paused
+    InvalidSignature = 39,         // Invalid cryptographic signature
+    Reentrancy = 40,               // Reentrant call detected
+    ContractPaused = 41,           // Contract is paused
 }
 
 #[contractimpl]
@@ -428,13 +434,18 @@ impl SkillSyncContract {
             .persistent()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if env.storage().persistent().get(&DataKey::Paused).unwrap_or(false) {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
             return Err(Error::ContractPaused);
         }
         Ok(())
-    }
-
     }
 
     pub fn create_session(
@@ -451,7 +462,15 @@ impl SkillSyncContract {
         let session_id = Self::generate_session_id(&env);
 
         // Lock funds, create the session record, and return the generated ID.
-        Self::lock_funds(env, session_id.clone(), payer, payee, asset, amount, fee_bps)?;
+        Self::lock_funds(
+            env,
+            session_id.clone(),
+            payer,
+            payee,
+            asset,
+            amount,
+            fee_bps,
+        )?;
 
         Ok(session_id)
     }
@@ -521,7 +540,7 @@ impl SkillSyncContract {
             updated_at: now,
             dispute_deadline,
             expires_at,
-            deadline: env.ledger().sequence(),
+            deadline: env.ledger().sequence() as u64,
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -547,12 +566,18 @@ impl SkillSyncContract {
         Ok(())
     }
 
-    pub fn complete_session(env: Env, session_id: Bytes, caller: Address, nonce: u64) -> Result<(), Error> {
+    pub fn complete_session(
+        env: Env,
+        session_id: Bytes,
+        caller: Address,
+        nonce: u64,
+    ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         use_nonce(&env, &caller, nonce)?;
         caller.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if session.status != SessionStatus::Locked {
             return Err(Error::InvalidSessionStatus);
@@ -579,7 +604,8 @@ impl SkillSyncContract {
     /// SessionRefundedEvent (closes issue #147).
     pub fn auto_refund(env: Env, session_id: Bytes) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if session.status != SessionStatus::Completed {
             return Err(Error::InvalidSessionStatus);
@@ -595,13 +621,17 @@ impl SkillSyncContract {
         let token_client = token::Client::new(&env, &session.asset);
         let contract_id = env.current_contract_address();
 
-        let fee = session.amount
+        let fee = session
+            .amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
             .ok_or(Error::FeeCalculationOverflow)?;
 
-        let total_locked = session.amount.checked_add(fee).ok_or(Error::FeeCalculationOverflow)?;
+        let total_locked = session
+            .amount
+            .checked_add(fee)
+            .ok_or(Error::FeeCalculationOverflow)?;
 
         token_client.transfer(&contract_id, &session.payer, &total_locked);
 
@@ -642,11 +672,17 @@ impl SkillSyncContract {
 
     /// Open a dispute on a session.
     /// Emits DisputeOpenedEvent (closes issue #149).
-    pub fn open_dispute(env: Env, session_id: Bytes, caller: Address, reason: Bytes) -> Result<(), Error> {
+    pub fn open_dispute(
+        env: Env,
+        session_id: Bytes,
+        caller: Address,
+        reason: Bytes,
+    ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         caller.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if caller != session.payer && caller != session.payee {
             return Err(Error::Unauthorized);
@@ -690,7 +726,8 @@ impl SkillSyncContract {
         let admin = read_admin(&env)?;
         admin.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if session.status != SessionStatus::Disputed {
             return Err(Error::SessionNotDisputed);
@@ -723,7 +760,8 @@ impl SkillSyncContract {
             _ => return Err(Error::InvalidResolutionAmount),
         }
 
-        let fee = session.amount
+        let fee = session
+            .amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
@@ -778,12 +816,15 @@ impl SkillSyncContract {
         session_id: Bytes,
         buyer_nonce: u64,
         seller_nonce: u64,
-        buyer_sig: Bytes,
-        seller_sig: Bytes,
+        buyer_public_key: BytesN<32>,
+        seller_public_key: BytesN<32>,
+        buyer_sig: BytesN<64>,
+        seller_sig: BytesN<64>,
     ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         // Get the session
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         // Check session status
         if session.status != SessionStatus::Completed {
@@ -792,27 +833,29 @@ impl SkillSyncContract {
 
         // Verify buyer signature
         let buyer_message = Self::create_approval_message(&env, &session_id, buyer_nonce);
-        if !env.crypto().ed25519_verify(session.payer.clone(), buyer_message, buyer_sig) {
-            return Err(Error::InvalidSignature);
-        }
+        env.crypto()
+            .ed25519_verify(&buyer_public_key, &buyer_message, &buyer_sig);
 
         // Verify seller signature
         let seller_message = Self::create_approval_message(&env, &session_id, seller_nonce);
-        if !env.crypto().ed25519_verify(session.payee.clone(), seller_message, seller_sig) {
-            return Err(Error::InvalidSignature);
-        }
+        env.crypto()
+            .ed25519_verify(&seller_public_key, &seller_message, &seller_sig);
 
         // Use nonces
         use_nonce(&env, &session.payer, buyer_nonce)?;
         use_nonce(&env, &session.payee, seller_nonce)?;
 
         // Calculate fee and payout
-        let fee = session.amount
+        let fee = session
+            .amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
             .ok_or(Error::FeeCalculationOverflow)?;
-        let payout = session.amount.checked_sub(fee).ok_or(Error::FeeCalculationOverflow)?;
+        let payout = session
+            .amount
+            .checked_sub(fee)
+            .ok_or(Error::FeeCalculationOverflow)?;
 
         // Transfer funds
         let token_client = token::Client::new(&env, &session.asset);
@@ -855,12 +898,18 @@ impl SkillSyncContract {
 
     /// Approve a session by the buyer after completion.
     /// This transfers funds to the seller and collects the platform fee.
-    pub fn approve_session(env: Env, session_id: Bytes, caller: Address, nonce: u64) -> Result<(), Error> {
+    pub fn approve_session(
+        env: Env,
+        session_id: Bytes,
+        caller: Address,
+        nonce: u64,
+    ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         use_nonce(&env, &caller, nonce)?;
         caller.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if session.status != SessionStatus::Completed {
             return Err(Error::InvalidSessionStatus);
@@ -871,12 +920,16 @@ impl SkillSyncContract {
         }
 
         // Calculate fee and payout
-        let fee = session.amount
+        let fee = session
+            .amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
             .ok_or(Error::FeeCalculationOverflow)?;
-        let payout = session.amount.checked_sub(fee).ok_or(Error::FeeCalculationOverflow)?;
+        let payout = session
+            .amount
+            .checked_sub(fee)
+            .ok_or(Error::FeeCalculationOverflow)?;
 
         // Transfer funds
         let token_client = token::Client::new(&env, &session.asset);
@@ -927,7 +980,8 @@ impl SkillSyncContract {
     ) -> Result<(), Error> {
         caller.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
         if session.status != SessionStatus::Locked {
             return Err(Error::InvalidSessionStatus);
         }
@@ -972,7 +1026,8 @@ impl SkillSyncContract {
     pub fn accept_extension(env: Env, session_id: Bytes, caller: Address) -> Result<(), Error> {
         caller.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
         if session.status != SessionStatus::Locked {
             return Err(Error::InvalidSessionStatus);
         }
@@ -981,7 +1036,9 @@ impl SkillSyncContract {
             return Err(Error::NotAuthorizedParty);
         }
 
-        let pending = session.pending_extension.ok_or(Error::ExtensionNotProposed)?;
+        let pending = session
+            .pending_extension
+            .ok_or(Error::ExtensionNotProposed)?;
         if pending.proposer == caller {
             return Err(Error::CannotAcceptOwnExtension);
         }
@@ -1004,6 +1061,7 @@ impl SkillSyncContract {
                 accepter: caller,
                 new_deadline: session.deadline,
                 accepted_at_ledger,
+                referrer: None,
             },
         );
 
@@ -1011,19 +1069,18 @@ impl SkillSyncContract {
     }
 
     fn create_approval_message(env: &Env, session_id: &Bytes, nonce: u64) -> Bytes {
-        let mut message = Bytes::new(env);
-        message.extend_from_slice(&session_id.clone());
+        let mut message = session_id.clone();
         message.extend_from_slice(&nonce.to_be_bytes());
         message
     }
 
     fn generate_session_id(env: &Env) -> Bytes {
         let mut id = Bytes::new(env);
-        // Use ledger sequence and contract address for uniqueness
         let seq = env.ledger().sequence();
         id.extend_from_slice(&seq.to_be_bytes());
-        let contract_id = env.current_contract_address();
-        id.extend_from_slice(contract_id.as_bytes());
+        // Use timestamp for additional uniqueness
+        let ts = env.ledger().timestamp();
+        id.extend_from_slice(&ts.to_be_bytes());
         id
     }
 
@@ -1037,14 +1094,20 @@ impl SkillSyncContract {
     pub fn get_treasury(env: Env) -> Address {
         match env.storage().instance().get(&DataKey::Treasury) {
             Some(addr) => addr,
-            None => read_admin(&env).unwrap_or_else(|_| panic_with_error!(&env, Error::NotInitialized)),
+            None => {
+                read_admin(&env).unwrap_or_else(|_| panic_with_error!(&env, Error::NotInitialized))
+            }
         }
     }
 
     fn add_to_expiry_index(env: Env, session_id: Bytes, expires_at: u64) -> Result<(), Error> {
         let day_bucket = expires_at / SECONDS_PER_DAY;
         let key = DataKey::ExpiryIndex(day_bucket);
-        let mut session_ids: Vec<Bytes> = env.storage().persistent().get(&key).unwrap_or_else(|| Vec::new(&env));
+        let mut session_ids: Vec<Bytes> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
         if !session_ids.contains(&session_id) {
             session_ids.push_back(session_id);
             env.storage().persistent().set(&key, &session_ids);
@@ -1074,19 +1137,31 @@ impl SkillSyncContract {
 }
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
+    env.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotInitialized)
 }
 
 fn acquire_lock(env: &Env) -> Result<(), Error> {
-    if env.storage().instance().get(&DataKey::ReentrancyLock).unwrap_or(false) {
+    if env
+        .storage()
+        .instance()
+        .get(&DataKey::ReentrancyLock)
+        .unwrap_or(false)
+    {
         return Err(Error::Reentrancy);
     }
-    env.storage().instance().set(&DataKey::ReentrancyLock, &true);
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyLock, &true);
     Ok(())
 }
 
 fn release_lock(env: &Env) {
-    env.storage().instance().set(&DataKey::ReentrancyLock, &false);
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyLock, &false);
 }
 
 fn use_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), Error> {
@@ -1142,142 +1217,9 @@ fn validate_note(note: &Option<Bytes>) -> Result<(), Error> {
     }
     Ok(())
 }
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec};
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    WasmHash,
-}
-mod contract;
-
-pub use contract::{
-    AutoRefundExecutedEvent, CoreContract, CoreContractClient, FundsLockedEvent, InitializedEvent,
-    Session, SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
-
-    ContractError, CoreContract, CoreContractClient, LockedSession, Session,
-    SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
-
-    CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
-    SessionStatus, RefundRequestedEvent, RefundedEvent, DisputeInitiatedEvent,
-    DisputeResolvedEvent,
-    SessionRefundedEvent, SessionStatus,
-};
-
-#[contractimpl]
-impl CoreContract {
-    pub fn init(env: Env, admin: Address) {
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &admin);
-    }
-
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        let old_wasm_hash: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&DataKey::WasmHash)
-            .unwrap_or(BytesN::from_array(&env, &[0; 32]));
-
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
-        env.storage().instance().set(&DataKey::WasmHash, &new_wasm_hash);
-        
-        env.events().publish(
-            (Symbol::new(&env, "ContractUpgraded"),),
-            (old_wasm_hash, new_wasm_hash),
-        );
-    }
-
-    pub fn hello(env: Env, to: Symbol) -> Vec<Symbol> {
-        let mut vec = Vec::new(&env);
-        vec.push_back(symbol_short!("Hello"));
-        vec.push_back(to);
-        vec
-    }
-}
 
 #[cfg(test)]
 mod test;
 
 #[cfg(test)]
 mod test_storage_persistence;
-
-#![no_std]
-
-mod contract;
-
-pub use contract::{
-    CoreContract, CoreContractClient, DisputeResolvedEvent, FeeDeductedEvent, InitializedEvent,
-    RefundEvent, Session, SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
-    CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
-    SessionRefundedEvent, SessionStatus,
-};
-
-#[cfg(test)]
-mod test;
-
-
-fn refund() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, CoreContract);
-    let result: Vec<Symbol> = env.invoke_contract(
-        &contract_id,
-        &symbol_short!("hello"),
-        vec![&env, symbol_short!("World")],
-    );
-    assert_eq!(result, vec![&env, symbol_short!("Hello"), symbol_short!("World")]);
-
-    
-#[contractimpl]
-impl CoreContract {
-    pub fn hello(env: Env, to: Symbol) -> Vec<Symbol> {
-        vec![&env, symbol_short!("Refund"), to]
-    }
-}
-}
-
-
-
-fn setup() -> (
-    Env,
-    CoreContractClient<'static>,
-    TokenClient<'static>,
-    StellarAssetClient<'static>,
-    Address,
-    Address,
-    Address,
-    Address,
-) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = TokenClient::new(&env, &token_address);
-    let asset_client = StellarAssetClient::new(&env, &token_address);
-
-    asset_client.mint(&buyer, &1_000);
-
-    let contract_id = env.register_contract(None, CoreContract);
-    let contract = CoreContractClient::new(&env, &contract_id);
-    contract.initialize(&treasury, &500);
-
-    (
-        env,
-        contract,
-        token_client,
-        asset_client,
-        buyer,
-        seller,
-        treasury,
-        contract_id,
-    )
-}
-
