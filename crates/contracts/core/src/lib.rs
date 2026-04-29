@@ -12,7 +12,7 @@ pub use events::{ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, Re
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
-    Env, Symbol, Vec,
+    BytesN, Env, Symbol, Vec,
 };
 
 pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
@@ -63,6 +63,15 @@ enum DataKey {
     ReferrerFeeBps,
     // Referrer accumulated fees: ReferrerBalance(Address, Asset) -> i128
     ReferrerBalance(Address, Address),
+    // Rate limiting configuration and counters
+    RateLimitConfig,
+    UserSessionCount(Address, u64),
+    Whitelist(Address),
+    // Multi-signature admin configuration
+    AdminList,
+    AdminThreshold,
+    // Admin proposal storage
+    Proposal(BytesN<32>),
 }
 
 #[contracttype]
@@ -221,6 +230,77 @@ pub struct UnpausedEvent {
     pub timestamp: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RateLimitHitEvent {
+    pub buyer: Address,
+    pub current_window: u64,
+    pub max_sessions: u32,
+    pub attempted_sessions: u32,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalCreatedEvent {
+    pub proposal_id: BytesN<32>,
+    pub proposer: Address,
+    pub proposal_type: u32,
+    pub created_at_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalSignedEvent {
+    pub proposal_id: BytesN<32>,
+    pub signer: Address,
+    pub signature_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProposalExecutedEvent {
+    pub proposal_id: BytesN<32>,
+    pub executor: Address,
+    pub executed_at_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProposalType {
+    SetFee = 0,
+    ContractPaused = 41,         // Contract is paused
+    RateLimitExceeded = 42,      // Buyer has exceeded the configured rate limit
+    NotAdmin = 43,               // Caller is not an authorized admin
+    InvalidThreshold = 44,       // Invalid multisig threshold or admin set
+    ProposalAlreadyExists = 45,   // Proposal with this ID already exists
+    ProposalNotFound = 46,        // Proposal not found
+    ProposalAlreadySigned = 47,   // Proposal already signed by this admin
+    ProposalExpired = 48,         // Proposal has expired
+    ProposalNotReady = 49,        // Proposal has not reached threshold yet
+    ProposalAlreadyExecuted = 50, // Proposal has already been executed
+    InvalidProposal = 51,         // Proposal payload format invalid
+    AdminOperationRequiresProposal = 52, // Critical admin operation must use proposal
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    pub proposal_id: BytesN<32>,
+    pub payload: Bytes,
+    pub proposer: Address,
+    pub signers: Vec<Address>,
+    pub created_at_ledger: u32,
+    pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RateLimitConfig {
+    pub max_sessions: u32,
+    pub window_ledgers: u32,
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 
 const VERSION: u32 = 1;
@@ -303,19 +383,22 @@ impl SkillSyncContract {
         env.storage().instance().set(&DataKey::Version, &VERSION);
 
         env.events().publish(
-            (Symbol::new(&env, "Initialized"),),
-            (
-                admin,
                 platform_fee_bps,
                 treasury_address,
                 dispute_window_secs,
                 VERSION,
+        if Self::is_multi_sig_enabled(&env) {
+            return Err(Error::AdminOperationRequiresProposal);
+        }
             ),
         );
 
         Ok(())
     }
-
+if Self::is_multi_sig_enabled(&env) {
+            return Err(Error::AdminOperationRequiresProposal);
+        }
+        
     /// Update the platform fee. Only callable by admin.
     /// Emits PlatformFeeUpdatedEvent (closes issue #151).
     pub fn set_platform_fee(env: Env, new_fee_bps: u32) -> Result<(), Error> {
@@ -357,6 +440,9 @@ impl SkillSyncContract {
     /// Update the treasury wallet. Only callable by admin.
     /// Emits TreasuryUpdated event (closes issue #152).
     pub fn set_treasury(env: Env, new_treasury: Address) -> Result<(), Error> {
+        if Self::is_multi_sig_enabled(&env) {
+            return Err(Error::AdminOperationRequiresProposal);
+        }
         let admin = read_admin(&env)?;
         admin.require_auth();
         Self::require_not_paused(&env)?;
@@ -376,7 +462,170 @@ impl SkillSyncContract {
             TreasuryUpdated {
                 old_treasury,
                 new_treasury,
-                updated_by: admin,
+           set_rate_limit(env: Env, max_sessions: u32, window_ledgers: u32) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if max_sessions == 0 || window_ledgers == 0 {
+            return Err(Error::InvalidThreshold);
+        }
+
+        env.storage().instance().set(
+            &DataKey::RateLimitConfig,
+            &RateLimitConfig {
+                max_sessions,
+                window_ledgers,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn set_whitelist_status(env: Env, address: Address, enabled: bool) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if enabled {
+            env.storage().instance().set(&DataKey::Whitelist(address.clone()), &true);
+        } else {
+            env.storage().instance().remove(&DataKey::Whitelist(address.clone()));
+        }
+
+        Ok(())
+    }
+
+    pub fn submit_admin_proposal(
+        env: Env,
+        proposal_id: BytesN<32>,
+        payload: Bytes,
+    ) -> Result<(), Error> {
+        let caller = env.invoker();
+        caller.require_auth();
+        if !Self::is_admin(&env, &caller) {
+            return Err(Error::NotAdmin);
+        }
+
+        let proposal_key = DataKey::Proposal(proposal_id.clone());
+        if env.storage().instance().has(&proposal_key) {
+            return Err(Error::ProposalAlreadyExists);
+        }
+
+        let mut signers = Vec::new(&env);
+        signers.push_back(caller.clone());
+
+        let proposal = Proposal {
+            proposal_id: proposal_id.clone(),
+            payload: payload.clone(),
+            proposer: caller.clone(),
+            signers,
+            created_at_ledger: env.ledger().sequence(),
+            executed: false,
+        };
+
+        env.storage().instance().set(&proposal_key, &proposal);
+
+        let proposal_type = payload.get(0).unwrap_or(0);
+        env.events().publish(
+            (Symbol::new(&env, "ProposalCreated"),),
+            ProposalCreatedEvent {
+                proposal_id,
+                proposer: caller,
+                proposal_type,
+                created_at_ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn sign_proposal(env: Env, proposal_id: BytesN<32>) -> Result<(), Error> {
+        let caller = env.invoker();
+        caller.require_auth();
+        if !Self::is_admin(&env, &caller) {
+            return Err(Error::NotAdmin);
+        }
+
+        let proposal_key = DataKey::Proposal(proposal_id.clone());
+        let mut proposal: Proposal = env
+            .storage()
+            .instance()
+            .get(&proposal_key)
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        if Self::proposal_has_signed(&proposal, &caller) {
+            return Err(Error::ProposalAlreadySigned);
+        }
+
+        if env.ledger().sequence() > proposal.created_at_ledger + 10_000 {
+            return Err(Error::ProposalExpired);
+        }
+
+        proposal.signers.push_back(caller.clone());
+        let signature_count = proposal.signers.len();
+
+        env.storage().instance().set(&proposal_key, &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "ProposalSigned"),),
+            ProposalSignedEvent {
+                proposal_id,
+                signer: caller,
+                signature_count,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn execute_proposal(env: Env, proposal_id: BytesN<32>) -> Result<(), Error> {
+        let caller = env.invoker();
+        caller.require_auth();
+        if !Self::is_admin(&env, &caller) {
+            return Err(Error::NotAdmin);
+        }
+
+        let proposal_key = DataKey::Proposal(proposal_id.clone());
+        let mut proposal: Proposal = env
+            .storage()
+            .instance()
+            .get(&proposal_key)
+            .ok_or(Error::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        if env.ledger().sequence() > proposal.created_at_ledger + 10_000 {
+            return Err(Error::ProposalExpired);
+        }
+
+        let threshold = Self::admin_threshold(&env);
+        if proposal.signers.len() < threshold as usize {
+            return Err(Error::ProposalNotReady);
+        }
+
+        Self::execute_proposal_payload(env.clone(), &proposal.payload, &caller)?;
+
+        proposal.executed = true;
+        env.storage().instance().set(&proposal_key, &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "ProposalExecuted"),),
+            ProposalExecutedEvent {
+                proposal_id,
+                executor: caller,
+                executed_at_ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn      updated_by: admin,
             },
         );
 
@@ -684,6 +933,9 @@ impl SkillSyncContract {
         session_id: Bytes,
         resolution: u32,
         buyer_share: i128,
+        if Self::is_multi_sig_enabled(&env) {
+            return Err(Error::AdminOperationRequiresProposal);
+        }
         seller_share: i128,
     ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
