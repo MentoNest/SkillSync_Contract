@@ -8,9 +8,7 @@ use soroban_sdk::contracterror;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ContractError {
-    // ── General (0–9) ────────────────────────────────────────────────────────
-    /// No error / success sentinel (unused at runtime, reserved as 0).
-    None = 0,
+    // ── General (1–9) ────────────────────────────────────────────────────────
     /// Contract has already been initialised.
     AlreadyInitialized = 1,
     /// Contract has not been initialised yet.
@@ -138,61 +136,4 @@ pub enum ContractError {
     /// The operation requires multi-sig approval.
     MultiSigRequired = 182,
 
-    // ── Reserved / Future Use (200–255) ───────────────────────────────────────
-    Reserved200 = 200,
-    Reserved201 = 201,
-    Reserved202 = 202,
-    Reserved203 = 203,
-    Reserved204 = 204,
-    Reserved205 = 205,
-    Reserved206 = 206,
-    Reserved207 = 207,
-    Reserved208 = 208,
-    Reserved209 = 209,
-    Reserved210 = 210,
-    Reserved211 = 211,
-    Reserved212 = 212,
-    Reserved213 = 213,
-    Reserved214 = 214,
-    Reserved215 = 215,
-    Reserved216 = 216,
-    Reserved217 = 217,
-    Reserved218 = 218,
-    Reserved219 = 219,
-    Reserved220 = 220,
-    Reserved221 = 221,
-    Reserved222 = 222,
-    Reserved223 = 223,
-    Reserved224 = 224,
-    Reserved225 = 225,
-    Reserved226 = 226,
-    Reserved227 = 227,
-    Reserved228 = 228,
-    Reserved229 = 229,
-    Reserved230 = 230,
-    Reserved231 = 231,
-    Reserved232 = 232,
-    Reserved233 = 233,
-    Reserved234 = 234,
-    Reserved235 = 235,
-    Reserved236 = 236,
-    Reserved237 = 237,
-    Reserved238 = 238,
-    Reserved239 = 239,
-    Reserved240 = 240,
-    Reserved241 = 241,
-    Reserved242 = 242,
-    Reserved243 = 243,
-    Reserved244 = 244,
-    Reserved245 = 245,
-    Reserved246 = 246,
-    Reserved247 = 247,
-    Reserved248 = 248,
-    Reserved249 = 249,
-    Reserved250 = 250,
-    Reserved251 = 251,
-    Reserved252 = 252,
-    Reserved253 = 253,
-    Reserved254 = 254,
-    Reserved255 = 255,
 }

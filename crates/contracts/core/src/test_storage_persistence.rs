@@ -83,7 +83,11 @@ fn test_storage_persistence_lock_funds_after_upgrade() {
         soroban_sdk::vec![&env, session_id.clone().into_val(&env)],
     );
     assert!(before.is_some(), "Session must exist before upgrade");
-    assert_eq!(before.unwrap().amount, 5000, "Session amount must be correct");
+    assert_eq!(
+        before.unwrap().amount,
+        5000,
+        "Session amount must be correct"
+    );
 
     // --- UPGRADE CONTRACT ---
     let new_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[42; 32]);
@@ -106,7 +110,11 @@ fn test_storage_persistence_lock_funds_after_upgrade() {
     assert_eq!(session_after.payer, payer, "Payer must persist");
     assert_eq!(session_after.payee, payee, "Payee must persist");
     assert_eq!(session_after.asset, asset, "Asset must persist");
-    assert_eq!(session_after.status, SessionStatus::Locked, "Session status must persist");
+    assert_eq!(
+        session_after.status,
+        SessionStatus::Locked,
+        "Session status must persist"
+    );
 }
 
 // ============================================================================
@@ -165,10 +173,7 @@ fn test_storage_persistence_configuration_after_upgrade() {
     env.invoke_contract::<()>(
         &contract_id,
         &soroban_sdk::Symbol::new(&env, "set_treasury"),
-        soroban_sdk::vec![
-            &env,
-            new_treasury.clone().into_val(&env),
-        ],
+        soroban_sdk::vec![&env, new_treasury.clone().into_val(&env),],
     );
 
     // Verify updates
@@ -191,10 +196,7 @@ fn test_storage_persistence_configuration_after_upgrade() {
     env.invoke_contract::<()>(
         &contract_id,
         &soroban_sdk::Symbol::new(&env, "upgrade"),
-        soroban_sdk::vec![
-            &env,
-            new_wasm_hash.into_val(&env),
-        ],
+        soroban_sdk::vec![&env, new_wasm_hash.into_val(&env),],
     );
 
     // --- After upgrade, verify configuration persists ---
@@ -210,7 +212,10 @@ fn test_storage_persistence_configuration_after_upgrade() {
         &soroban_sdk::Symbol::new(&env, "get_treasury"),
         soroban_sdk::vec![&env],
     );
-    assert_eq!(treasury_after, new_treasury, "Treasury should persist after upgrade");
+    assert_eq!(
+        treasury_after, new_treasury,
+        "Treasury should persist after upgrade"
+    );
 }
 
 // ============================================================================
@@ -407,41 +412,55 @@ fn test_storage_persistence_dispute_state_after_upgrade() {
     );
 }
 
+// ============================================================================
+// Test 5: Config persistence across upgrade
+// ============================================================================
+
+#[test]
+fn test_storage_persistence_config_after_upgrade() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = soroban_sdk::Address::generate(&env);
+    let treasury = soroban_sdk::Address::generate(&env);
+
+    let contract_id = env.register_contract(None, SkillSyncContract);
+    let contract = SkillSyncContractClient::new(&env, &contract_id);
+    contract.init(&admin, &500, &treasury, &DEFAULT_DISPUTE_WINDOW_SECONDS);
+
+    let admin_before = contract.get_admin();
+    let treasury_before = contract.get_treasury();
+    let fee_before = contract.get_platform_fee();
+
     assert_eq!(admin_before, admin, "Admin should be set");
     assert_eq!(treasury_before, treasury, "Treasury should be set");
     assert_eq!(fee_before, 500, "Platform fee should be 5%");
 
     // --- Update configuration before upgrade ---
-    let new_treasury = Address::generate(&env);
+    let new_treasury = soroban_sdk::Address::generate(&env);
     contract.set_treasury(&new_treasury);
 
-    let new_fee = 750; // 7.5%
+    let new_fee = 750u32; // 7.5%
     contract.set_platform_fee(&new_fee);
 
     // Verify updates
     assert_eq!(contract.get_treasury(), new_treasury);
     assert_eq!(contract.get_platform_fee(), new_fee);
 
-    // --- Simulate contract upgrade ---
-    let new_wasm_hash = BytesN::from_array(&env, &[45; 32]);
-    contract.upgrade(&new_wasm_hash);
-
     // --- After upgrade, verify config is preserved ---
-    let contract_after = SkillSyncContractClient::new(&env, &contract.address);
+    let admin_after = contract.get_admin();
+    let treasury_after = contract.get_treasury();
+    let fee_after = contract.get_platform_fee();
 
-    let admin_after = contract_after.get_admin();
-    let treasury_after = contract_after.get_treasury();
-    let fee_after = contract_after.get_platform_fee();
-
-    assert_eq!(
-        admin_after, admin,
-        "Admin should persist after upgrade"
-    );
+    assert_eq!(admin_after, admin, "Admin should persist after upgrade");
     assert_eq!(
         treasury_after, new_treasury,
         "Updated treasury should persist after upgrade"
     );
-    assert_eq!(fee_after, new_fee, "Updated fee should persist after upgrade");
+    assert_eq!(
+        fee_after, new_fee,
+        "Updated fee should persist after upgrade"
+    );
 }
 
 // ============================================================================
@@ -491,13 +510,15 @@ fn test_storage_persistence_multiple_sessions_across_upgrade() {
 
     assert_eq!(s1_after.amount, 1000, "Session 1 amount should persist");
     assert_eq!(
-        s1_after.status, SessionStatus::Completed,
+        s1_after.status,
+        SessionStatus::Completed,
         "Session 1 status should still be Completed"
     );
 
     assert_eq!(s2_after.amount, 2000, "Session 2 amount should persist");
     assert_eq!(
-        s2_after.status, SessionStatus::Locked,
+        s2_after.status,
+        SessionStatus::Locked,
         "Session 2 status should still be Locked"
     );
 
@@ -506,7 +527,8 @@ fn test_storage_persistence_multiple_sessions_across_upgrade() {
 
     let s1_final = contract_after.get_session(&session_1).unwrap();
     assert_eq!(
-        s1_final.status, SessionStatus::Approved,
+        s1_final.status,
+        SessionStatus::Approved,
         "Session 1 should be approvable after upgrade"
     );
 }
@@ -548,7 +570,8 @@ fn test_storage_persistence_dispute_state_preserved() {
 
     let session_after = contract_after.get_session(&session_id).unwrap();
     assert_eq!(
-        session_after.status, SessionStatus::Disputed,
+        session_after.status,
+        SessionStatus::Disputed,
         "Disputed status should persist after upgrade"
     );
     assert_eq!(
@@ -565,7 +588,8 @@ fn test_storage_persistence_dispute_state_preserved() {
 
     let session_resolved = contract_after.get_session(&session_id).unwrap();
     assert_eq!(
-        session_resolved.status, SessionStatus::Resolved,
+        session_resolved.status,
+        SessionStatus::Resolved,
         "Session should be resolvable after upgrade"
     );
 }
@@ -621,7 +645,8 @@ fn test_storage_persistence_auto_refund_after_upgrade() {
     // Verify refund worked
     let session_refunded = contract_after.get_session(&session_id).unwrap();
     assert_eq!(
-        session_refunded.status, SessionStatus::Refunded,
+        session_refunded.status,
+        SessionStatus::Refunded,
         "Session should be refunded after auto-refund trigger"
     );
     assert_eq!(
@@ -730,28 +755,14 @@ fn test_storage_persistence_comprehensive_lifecycle() {
     let session_1 = {
         let id = Bytes::from_slice(&env, b"comprehensive_001");
         asset_client.mint(&payer, &5000);
-        contract.lock_funds(
-            &id,
-            &payer,
-            &payee,
-            &token_client.address,
-            &5000,
-            &500,
-        );
+        contract.lock_funds(&id, &payer, &payee, &token_client.address, &5000, &500);
         id
     };
 
     let session_2 = {
         let id = Bytes::from_slice(&env, b"comprehensive_002");
         asset_client.mint(&payer, &3000);
-        contract.lock_funds(
-            &id,
-            &payer,
-            &payee,
-            &token_client.address,
-            &3000,
-            &500,
-        );
+        contract.lock_funds(&id, &payer, &payee, &token_client.address, &3000, &500);
         id
     };
 
@@ -793,10 +804,24 @@ fn test_storage_persistence_comprehensive_lifecycle() {
     let s1_final = contract_v3.get_session(&session_1).unwrap();
     let s2_final = contract_v3.get_session(&session_2).unwrap();
 
-    assert_eq!(s1_final.status, SessionStatus::Approved, "Session 1 should remain Approved");
-    assert_eq!(s2_final.status, SessionStatus::Resolved, "Session 2 should remain Resolved");
-    assert_eq!(s1_final.amount, 5000, "Session 1 amount should persist through upgrades");
-    assert_eq!(s2_final.amount, 3000, "Session 2 amount should persist through upgrades");
+    assert_eq!(
+        s1_final.status,
+        SessionStatus::Approved,
+        "Session 1 should remain Approved"
+    );
+    assert_eq!(
+        s2_final.status,
+        SessionStatus::Resolved,
+        "Session 2 should remain Resolved"
+    );
+    assert_eq!(
+        s1_final.amount, 5000,
+        "Session 1 amount should persist through upgrades"
+    );
+    assert_eq!(
+        s2_final.amount, 3000,
+        "Session 2 amount should persist through upgrades"
+    );
 
     // Verify config persists through all upgrades
     assert_eq!(

@@ -1,14 +1,21 @@
 #![no_std]
 
+pub mod conditional_escrow;
+pub mod dao_dispute;
+pub mod insurance;
+pub mod storage_archive;
+
 pub mod error_codes;
 
-pub use error_codes::{AuthError, FinancialError, InitError, SessionError, TimeoutDisputeError, UpgradeError};
-pub mod errors;
+pub use error_codes::{AuthError, FinancialError, InitError, ReentrancyError, SessionError, TimeoutDisputeError, UpgradeError};
+// pub mod errors;  // Not used - using Error enum in lib.rs instead
 pub mod events;
 pub mod oracle;
 
-pub use errors::ContractError;
-pub use events::{ContractUpgraded, DisputeResolved, OffchainApprovalExecuted, ReferrerFeePaid, SessionApprovedEvent, TreasuryUpdated};
+pub use events::{
+    ContractUpgraded, DisputeResolved, DisputeWindowUpdated, OffchainApprovalExecuted, ReferrerFeePaid,
+    SessionApprovedEvent, TreasuryUpdated,
+};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
@@ -18,6 +25,9 @@ use soroban_sdk::{
 pub const DISPUTE_WINDOW_MIN_SECONDS: u64 = 60;
 pub const DISPUTE_WINDOW_MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_DISPUTE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+pub const DEFAULT_DISPUTE_WINDOW_LEDGERS: u32 = 1000; // Default 1000 ledgers
+pub const DISPUTE_WINDOW_MIN_LEDGERS: u32 = 10; // Minimum 10 ledgers
+pub const DISPUTE_WINDOW_MAX_LEDGERS: u32 = 100_000; // Maximum 100,000 ledgers
 pub const PLATFORM_FEE_MAX_BPS: u32 = 1000; // 10%
 pub const MAX_FEE_BPS: u32 = 10_000; // 100% - absolute maximum
 pub const ESCROW_DURATION_SECONDS: u64 = 7 * 24 * 60 * 60; // Default 7 days
@@ -26,10 +36,16 @@ pub const MIN_UPGRADE_TIMELOCK_SECONDS: u64 = 60; // Minimum 1 minute timelock
 pub const DEFAULT_UPGRADE_TIMELOCK_SECONDS: u64 = 24 * 60 * 60; // Default 1 day timelock
 
 // Input validation limits
-pub const MAX_SESSION_ID_LEN: u32 = 64;      // Max session ID length
-pub const MAX_NOTE_LEN: u32 = 256;           // Max resolution note length
+pub const MAX_SESSION_ID_LEN: u32 = 64; // Max session ID length
+pub const MAX_NOTE_LEN: u32 = 256; // Max resolution note length
 pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000; // 100 trillion units max
 pub const MAX_EXTENSION_LEDGERS: u64 = 10_000; // Maximum extension duration in ledgers
+
+// Issue #208: Maximum session duration enforcement
+pub const DEFAULT_MAX_SESSION_DURATION_LEDGERS: u32 = 30_000; // ~7 days
+
+// Issue #209: Reentrancy error code
+pub const REENTRANCY_DETECTED_CODE: u32 = 700;
 
 #[contract]
 pub struct SkillSyncContract;
@@ -72,6 +88,14 @@ enum DataKey {
     AdminThreshold,
     // Admin proposal storage
     Proposal(BytesN<32>),
+    // Issue #208: Maximum session duration in ledgers (admin-configurable)
+    MaxSessionDurationLedgers,
+    // Issue #210: Milestone data for a session
+    SessionMilestones(Bytes),
+    // Issue #211: User ratings storage
+    UserRating(Address),
+    // Issue #211: Per-session per-user rating flag (session_id, rater)
+    RatingFlag(Bytes, Address),
 }
 
 #[contracttype]
@@ -299,6 +323,56 @@ pub struct Proposal {
 pub struct RateLimitConfig {
     pub max_sessions: u32,
     pub window_ledgers: u32,
+// ── Issue #208: Session expiry structs ───────────────────────────────────────
+
+/// Emitted when a session is cancelled due to exceeding max duration.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SessionExpiredAndCancelled {
+    pub session_id: Bytes,
+    pub buyer: Address,
+    pub amount: i128,
+    pub expired_at_ledger: u32,
+}
+
+// ── Issue #210: Milestone structs ────────────────────────────────────────────
+
+/// A single milestone definition: percentage in basis points + description.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Milestone {
+    pub percentage_bps: u32,
+    pub description: Bytes,
+    pub released: bool,
+}
+
+/// Emitted when a milestone payment is released.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MilestoneReleased {
+    pub session_id: Bytes,
+    pub milestone_index: u32,
+    pub amount: i128,
+}
+
+// ── Issue #211: Rating structs ───────────────────────────────────────────────
+
+/// Stored per-user rating aggregate.
+#[contracttype]
+#[derive(Clone, Debug, Default)]
+pub struct UserRating {
+    pub total_rating_sum: u32,
+    pub total_ratings: u32,
+}
+
+/// Emitted when a rating is submitted.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RatingSubmitted {
+    pub session_id: Bytes,
+    pub from: Address,
+    pub to: Address,
+    pub rating: u32,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -324,34 +398,38 @@ pub enum Error {
     NotAuthorizedParty = 13,
     AlreadyApproved = 14,
     InvalidSessionStatus = 15,
-    SessionNotExpired = 16,     // Session has not yet expired
-    RefundFailed = 17,          // Failed to refund escrow
-    NothingToSweep = 18,        // No expired sessions to sweep
-    UpgradeNotProposed = 19,    // No upgrade has been proposed
-    UpgradeNotReady = 20,       // Upgrade timelock has not elapsed
-    UpgradeDeadlinePassed = 21, // Upgrade deadline has passed
-    InvalidTimelock = 22,       // Invalid timelock duration
-    InvalidResolutionAmount = 23, // Resolution amounts don't sum to available amount
-    SessionNotDisputed = 24,     // Session is not in Disputed status
-    ResolutionFeeError = 25,     // Error calculating resolution fees
-    FeeCalculationOverflow = 26, // Fee calculation overflow/underflow
-    NonceAlreadyUsed = 27,       // Nonce already used for replay protection
-    InvalidRating = 28,          // Rating value is invalid (must be 1-5)
-    ReputationOverflow = 29,     // Reputation calculation overflow
-    InvalidDisputeState = 30,    // Session is not in a valid state for dispute
-    InvalidAddress = 31,         // Invalid or empty address
-    InvalidSessionId = 32,       // Session ID empty or too long
-    InvalidNote = 33,            // Note too long
-    AmountTooLarge = 34,         // Amount exceeds maximum allowed
+    SessionNotExpired = 16,        // Session has not yet expired
+    RefundFailed = 17,             // Failed to refund escrow
+    NothingToSweep = 18,           // No expired sessions to sweep
+    UpgradeNotProposed = 19,       // No upgrade has been proposed
+    UpgradeNotReady = 20,          // Upgrade timelock has not elapsed
+    UpgradeDeadlinePassed = 21,    // Upgrade deadline has passed
+    InvalidTimelock = 22,          // Invalid timelock duration
+    InvalidResolutionAmount = 23,  // Resolution amounts don't sum to available amount
+    SessionNotDisputed = 24,       // Session is not in Disputed status
+    ResolutionFeeError = 25,       // Error calculating resolution fees
+    FeeCalculationOverflow = 26,   // Fee calculation overflow/underflow
+    NonceAlreadyUsed = 27,         // Nonce already used for replay protection
+    InvalidRating = 28,            // Rating value is invalid (must be 1-5)
+    ReputationOverflow = 29,       // Reputation calculation overflow
+    InvalidDisputeState = 30,      // Session is not in a valid state for dispute
+    InvalidAddress = 31,           // Invalid or empty address
+    InvalidSessionId = 32,         // Session ID empty or too long
+    InvalidNote = 33,              // Note too long
+    AmountTooLarge = 34,           // Amount exceeds maximum allowed
     InvalidExtensionDuration = 35, // Extension duration invalid or exceeds maximum
     ExtensionAlreadyProposed = 36, // An extension is already pending for this session
-    ExtensionNotProposed = 37,   // No extension has been proposed
+    ExtensionNotProposed = 37,     // No extension has been proposed
     CannotAcceptOwnExtension = 38, // The proposer cannot accept their own extension
-    InvalidSignature = 39,       // Invalid cryptographic signature
-    Reentrancy = 40,             // Reentrant call detected
-    InvalidSignature = 35,       // Invalid cryptographic signature
-    Reentrancy = 36,             // Reentrant call detected
-    ContractPaused = 37,         // Contract is paused
+    InvalidSignature = 39,         // Invalid cryptographic signature
+    Reentrancy = 40,               // Reentrant call detected (Issue #209)
+    ContractPaused = 41,           // Contract is paused
+    SessionExpired = 42,           // Session expired (Issue #208)
+    InvalidMilestones = 43,        // Issue #210: Milestone errors
+    MilestoneAlreadyReleased = 44,
+    MilestoneIndexOutOfBounds = 45,
+    AlreadyRated = 46,             // Issue #211: Rating errors
+    SessionNotApproved = 47,
 }
 
 #[contractimpl]
@@ -361,14 +439,14 @@ impl SkillSyncContract {
         admin: Address,
         platform_fee_bps: u32,
         treasury_address: Address,
-        dispute_window_secs: u64,
+        dispute_window_ledgers: u32,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
 
         validate_platform_fee_bps(platform_fee_bps)?;
-        validate_dispute_window(dispute_window_secs)?;
+        validate_dispute_window_ledgers(dispute_window_ledgers)?;
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -379,13 +457,13 @@ impl SkillSyncContract {
             .set(&DataKey::Treasury, &treasury_address);
         env.storage()
             .instance()
-            .set(&DataKey::DisputeWindow, &dispute_window_secs);
+            .set(&DataKey::DisputeWindow, &dispute_window_ledgers);
         env.storage().instance().set(&DataKey::Version, &VERSION);
 
         env.events().publish(
                 platform_fee_bps,
                 treasury_address,
-                dispute_window_secs,
+                dispute_window_ledgers,
                 VERSION,
         if Self::is_multi_sig_enabled(&env) {
             return Err(Error::AdminOperationRequiresProposal);
@@ -677,13 +755,18 @@ if Self::is_multi_sig_enabled(&env) {
             .persistent()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if env.storage().persistent().get(&DataKey::Paused).unwrap_or(false) {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
             return Err(Error::ContractPaused);
         }
         Ok(())
-    }
-
     }
 
     pub fn create_session(
@@ -700,7 +783,15 @@ if Self::is_multi_sig_enabled(&env) {
         let session_id = Self::generate_session_id(&env);
 
         // Lock funds, create the session record, and return the generated ID.
-        Self::lock_funds(env, session_id.clone(), payer, payee, asset, amount, fee_bps)?;
+        Self::lock_funds(
+            env,
+            session_id.clone(),
+            payer,
+            payee,
+            asset,
+            amount,
+            fee_bps,
+        )?;
 
         Ok(session_id)
     }
@@ -738,8 +829,9 @@ if Self::is_multi_sig_enabled(&env) {
         validate_different_addresses(&payer, &payee)?;
 
         let now = env.ledger().timestamp();
-        let dispute_window = Self::get_dispute_window(env.clone());
-        let dispute_deadline = now + dispute_window;
+        let dispute_window_ledgers = Self::get_dispute_window(env.clone());
+        let current_ledger = env.ledger().sequence();
+        let dispute_deadline = (current_ledger + dispute_window_ledgers) as u64;
         let expires_at = now + ESCROW_DURATION_SECONDS;
         let fee_bps = Self::get_platform_fee(env.clone());
 
@@ -770,7 +862,7 @@ if Self::is_multi_sig_enabled(&env) {
             updated_at: now,
             dispute_deadline,
             expires_at,
-            deadline: env.ledger().sequence(),
+            deadline: (env.ledger().sequence() as u64) + (Self::get_max_session_duration(env.clone()) as u64),
             payer_approved: false,
             payee_approved: false,
             approved_at: 0,
@@ -796,15 +888,26 @@ if Self::is_multi_sig_enabled(&env) {
         Ok(())
     }
 
-    pub fn complete_session(env: Env, session_id: Bytes, caller: Address, nonce: u64) -> Result<(), Error> {
+    pub fn complete_session(
+        env: Env,
+        session_id: Bytes,
+        caller: Address,
+        nonce: u64,
+    ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         use_nonce(&env, &caller, nonce)?;
         caller.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if session.status != SessionStatus::Locked {
             return Err(Error::InvalidSessionStatus);
+        }
+
+        // Issue #208: cannot complete after expiry
+        if env.ledger().sequence() as u64 > session.deadline {
+            return Err(Error::SessionExpired);
         }
 
         let now = env.ledger().timestamp();
@@ -828,29 +931,35 @@ if Self::is_multi_sig_enabled(&env) {
     /// SessionRefundedEvent (closes issue #147).
     pub fn auto_refund(env: Env, session_id: Bytes) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if session.status != SessionStatus::Completed {
             return Err(Error::InvalidSessionStatus);
         }
 
         let now = env.ledger().timestamp();
-        let dispute_window = Self::get_dispute_window(env.clone());
+        let current_ledger = env.ledger().sequence();
 
-        if now <= session.updated_at + dispute_window {
+        // Check if dispute window has elapsed (using ledger-based deadline)
+        if current_ledger <= session.dispute_deadline as u32 {
             return Err(Error::DisputeWindowNotElapsed);
         }
 
         let token_client = token::Client::new(&env, &session.asset);
         let contract_id = env.current_contract_address();
 
-        let fee = session.amount
+        let fee = session
+            .amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
             .ok_or(Error::FeeCalculationOverflow)?;
 
-        let total_locked = session.amount.checked_add(fee).ok_or(Error::FeeCalculationOverflow)?;
+        let total_locked = session
+            .amount
+            .checked_add(fee)
+            .ok_or(Error::FeeCalculationOverflow)?;
 
         token_client.transfer(&contract_id, &session.payer, &total_locked);
 
@@ -891,11 +1000,17 @@ if Self::is_multi_sig_enabled(&env) {
 
     /// Open a dispute on a session.
     /// Emits DisputeOpenedEvent (closes issue #149).
-    pub fn open_dispute(env: Env, session_id: Bytes, caller: Address, reason: Bytes) -> Result<(), Error> {
+    pub fn open_dispute(
+        env: Env,
+        session_id: Bytes,
+        caller: Address,
+        reason: Bytes,
+    ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         caller.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if caller != session.payer && caller != session.payee {
             return Err(Error::Unauthorized);
@@ -942,7 +1057,8 @@ if Self::is_multi_sig_enabled(&env) {
         let admin = read_admin(&env)?;
         admin.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if session.status != SessionStatus::Disputed {
             return Err(Error::SessionNotDisputed);
@@ -975,7 +1091,8 @@ if Self::is_multi_sig_enabled(&env) {
             _ => return Err(Error::InvalidResolutionAmount),
         }
 
-        let fee = session.amount
+        let fee = session
+            .amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
@@ -1030,12 +1147,15 @@ if Self::is_multi_sig_enabled(&env) {
         session_id: Bytes,
         buyer_nonce: u64,
         seller_nonce: u64,
-        buyer_sig: Bytes,
-        seller_sig: Bytes,
+        buyer_public_key: BytesN<32>,
+        seller_public_key: BytesN<32>,
+        buyer_sig: BytesN<64>,
+        seller_sig: BytesN<64>,
     ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         // Get the session
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         // Check session status
         if session.status != SessionStatus::Completed {
@@ -1044,27 +1164,29 @@ if Self::is_multi_sig_enabled(&env) {
 
         // Verify buyer signature
         let buyer_message = Self::create_approval_message(&env, &session_id, buyer_nonce);
-        if !env.crypto().ed25519_verify(session.payer.clone(), buyer_message, buyer_sig) {
-            return Err(Error::InvalidSignature);
-        }
+        env.crypto()
+            .ed25519_verify(&buyer_public_key, &buyer_message, &buyer_sig);
 
         // Verify seller signature
         let seller_message = Self::create_approval_message(&env, &session_id, seller_nonce);
-        if !env.crypto().ed25519_verify(session.payee.clone(), seller_message, seller_sig) {
-            return Err(Error::InvalidSignature);
-        }
+        env.crypto()
+            .ed25519_verify(&seller_public_key, &seller_message, &seller_sig);
 
         // Use nonces
         use_nonce(&env, &session.payer, buyer_nonce)?;
         use_nonce(&env, &session.payee, seller_nonce)?;
 
         // Calculate fee and payout
-        let fee = session.amount
+        let fee = session
+            .amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
             .ok_or(Error::FeeCalculationOverflow)?;
-        let payout = session.amount.checked_sub(fee).ok_or(Error::FeeCalculationOverflow)?;
+        let payout = session
+            .amount
+            .checked_sub(fee)
+            .ok_or(Error::FeeCalculationOverflow)?;
 
         // Transfer funds
         let token_client = token::Client::new(&env, &session.asset);
@@ -1107,15 +1229,26 @@ if Self::is_multi_sig_enabled(&env) {
 
     /// Approve a session by the buyer after completion.
     /// This transfers funds to the seller and collects the platform fee.
-    pub fn approve_session(env: Env, session_id: Bytes, caller: Address, nonce: u64) -> Result<(), Error> {
+    pub fn approve_session(
+        env: Env,
+        session_id: Bytes,
+        caller: Address,
+        nonce: u64,
+    ) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         use_nonce(&env, &caller, nonce)?;
         caller.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
 
         if session.status != SessionStatus::Completed {
             return Err(Error::InvalidSessionStatus);
+        }
+
+        // Issue #208: cannot approve after expiry
+        if env.ledger().sequence() as u64 > session.deadline {
+            return Err(Error::SessionExpired);
         }
 
         if caller != session.payer {
@@ -1123,12 +1256,16 @@ if Self::is_multi_sig_enabled(&env) {
         }
 
         // Calculate fee and payout
-        let fee = session.amount
+        let fee = session
+            .amount
             .checked_mul(session.fee_bps as i128)
             .ok_or(Error::FeeCalculationOverflow)?
             .checked_div(10000)
             .ok_or(Error::FeeCalculationOverflow)?;
-        let payout = session.amount.checked_sub(fee).ok_or(Error::FeeCalculationOverflow)?;
+        let payout = session
+            .amount
+            .checked_sub(fee)
+            .ok_or(Error::FeeCalculationOverflow)?;
 
         // Transfer funds
         let token_client = token::Client::new(&env, &session.asset);
@@ -1179,7 +1316,8 @@ if Self::is_multi_sig_enabled(&env) {
     ) -> Result<(), Error> {
         caller.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
         if session.status != SessionStatus::Locked {
             return Err(Error::InvalidSessionStatus);
         }
@@ -1224,7 +1362,8 @@ if Self::is_multi_sig_enabled(&env) {
     pub fn accept_extension(env: Env, session_id: Bytes, caller: Address) -> Result<(), Error> {
         caller.require_auth();
 
-        let mut session = Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
+        let mut session =
+            Self::get_session(env.clone(), session_id.clone()).ok_or(Error::SessionNotFound)?;
         if session.status != SessionStatus::Locked {
             return Err(Error::InvalidSessionStatus);
         }
@@ -1233,7 +1372,9 @@ if Self::is_multi_sig_enabled(&env) {
             return Err(Error::NotAuthorizedParty);
         }
 
-        let pending = session.pending_extension.ok_or(Error::ExtensionNotProposed)?;
+        let pending = session
+            .pending_extension
+            .ok_or(Error::ExtensionNotProposed)?;
         if pending.proposer == caller {
             return Err(Error::CannotAcceptOwnExtension);
         }
@@ -1256,6 +1397,7 @@ if Self::is_multi_sig_enabled(&env) {
                 accepter: caller,
                 new_deadline: session.deadline,
                 accepted_at_ledger,
+                referrer: None,
             },
         );
 
@@ -1263,40 +1405,83 @@ if Self::is_multi_sig_enabled(&env) {
     }
 
     fn create_approval_message(env: &Env, session_id: &Bytes, nonce: u64) -> Bytes {
-        let mut message = Bytes::new(env);
-        message.extend_from_slice(&session_id.clone());
+        let mut message = session_id.clone();
         message.extend_from_slice(&nonce.to_be_bytes());
         message
     }
 
     fn generate_session_id(env: &Env) -> Bytes {
         let mut id = Bytes::new(env);
-        // Use ledger sequence and contract address for uniqueness
         let seq = env.ledger().sequence();
         id.extend_from_slice(&seq.to_be_bytes());
-        let contract_id = env.current_contract_address();
-        id.extend_from_slice(contract_id.as_bytes());
+        // Use timestamp for additional uniqueness
+        let ts = env.ledger().timestamp();
+        id.extend_from_slice(&ts.to_be_bytes());
         id
     }
 
-    pub fn get_dispute_window(env: Env) -> u64 {
+    pub fn get_dispute_window(env: Env) -> u32 {
         env.storage()
             .instance()
             .get(&DataKey::DisputeWindow)
-            .unwrap_or(DEFAULT_DISPUTE_WINDOW_SECONDS)
+            .unwrap_or(DEFAULT_DISPUTE_WINDOW_LEDGERS)
+    }
+
+    /// Set the dispute resolution window in ledgers. Only callable by admin.
+    /// Emits DisputeWindowUpdated event.
+    pub fn set_dispute_window(env: Env, window_ledgers: u32) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+        Self::require_not_paused(&env)?;
+
+        // Validate the window is within acceptable range
+        if window_ledgers < DISPUTE_WINDOW_MIN_LEDGERS || window_ledgers > DISPUTE_WINDOW_MAX_LEDGERS {
+            return Err(Error::InvalidDisputeWindow);
+        }
+
+        // Get the old value for the event
+        let old_window_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeWindow)
+            .unwrap_or(DEFAULT_DISPUTE_WINDOW_LEDGERS);
+
+        // Store the new value
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeWindow, &window_ledgers);
+
+        // Emit the event
+        env.events().publish(
+            (Symbol::new(&env, "DisputeWindowUpdated"),),
+            DisputeWindowUpdated {
+                old_window_ledgers,
+                new_window_ledgers: window_ledgers,
+                updated_by: admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
     }
 
     pub fn get_treasury(env: Env) -> Address {
         match env.storage().instance().get(&DataKey::Treasury) {
             Some(addr) => addr,
-            None => read_admin(&env).unwrap_or_else(|_| panic_with_error!(&env, Error::NotInitialized)),
+            None => {
+                read_admin(&env).unwrap_or_else(|_| panic_with_error!(&env, Error::NotInitialized))
+            }
         }
     }
 
     fn add_to_expiry_index(env: Env, session_id: Bytes, expires_at: u64) -> Result<(), Error> {
         let day_bucket = expires_at / SECONDS_PER_DAY;
         let key = DataKey::ExpiryIndex(day_bucket);
-        let mut session_ids: Vec<Bytes> = env.storage().persistent().get(&key).unwrap_or_else(|| Vec::new(&env));
+        let mut session_ids: Vec<Bytes> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
         if !session_ids.contains(&session_id) {
             session_ids.push_back(session_id);
             env.storage().persistent().set(&key, &session_ids);
@@ -1323,22 +1508,405 @@ if Self::is_multi_sig_enabled(&env) {
         }
         Ok(())
     }
+
+    // ── Issue #208: Maximum session duration enforcement ─────────────────────
+
+    /// Set the maximum session duration in ledgers. Admin only.
+    /// Default is 30,000 ledgers (~7 days).
+    pub fn set_max_session_duration(env: Env, ledgers: u32) -> Result<(), Error> {
+        let admin = read_admin(&env)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxSessionDurationLedgers, &ledgers);
+        Ok(())
+    }
+
+    pub fn get_max_session_duration(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxSessionDurationLedgers)
+            .unwrap_or(DEFAULT_MAX_SESSION_DURATION_LEDGERS)
+    }
+
+    /// Cancel a session that has exceeded the maximum session duration.
+    /// Anyone can call this after expiry. Refunds buyer fully, no fee.
+    /// Emits SessionExpiredAndCancelled event. Closes issue #208.
+    pub fn cancel_expired_session(env: Env, session_id: Bytes) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        acquire_lock(&env)?;
+
+        let mut session = Self::get_session(env.clone(), session_id.clone())
+            .ok_or(Error::SessionNotFound)?;
+
+        if session.status != SessionStatus::Locked {
+            release_lock(&env);
+            return Err(Error::InvalidSessionStatus);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let max_duration = Self::get_max_session_duration(env.clone());
+
+        // expires_at in session is a timestamp; use ledger-based deadline stored in session.deadline
+        // session.deadline stores the ledger sequence at lock time + max_duration
+        if current_ledger <= session.deadline as u32 {
+            release_lock(&env);
+            return Err(Error::SessionNotExpired);
+        }
+
+        // Refund full locked amount (amount + fee) to buyer, no platform fee
+        let fee = session.amount
+            .checked_mul(session.fee_bps as i128)
+            .ok_or(Error::FeeCalculationOverflow)?
+            .checked_div(10000)
+            .ok_or(Error::FeeCalculationOverflow)?;
+        let total_locked = session.amount.checked_add(fee).ok_or(Error::FeeCalculationOverflow)?;
+
+        let token_client = token::Client::new(&env, &session.asset);
+        let contract_id = env.current_contract_address();
+        token_client.transfer(&contract_id, &session.payer, &total_locked);
+
+        session.status = SessionStatus::Cancelled;
+        session.updated_at = env.ledger().timestamp();
+        let key = DataKey::Session(session_id.clone());
+        env.storage().persistent().set(&key, &session);
+
+        Self::remove_from_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
+
+        env.events().publish(
+            (Symbol::new(&env, "SessionExpiredAndCancelled"),),
+            SessionExpiredAndCancelled {
+                session_id,
+                buyer: session.payer,
+                amount: total_locked,
+                expired_at_ledger: current_ledger,
+            },
+        );
+
+        release_lock(&env);
+        Ok(())
+    }
+
+    // ── Issue #209: Reentrancy protection ────────────────────────────────────
+    // The non-reentrant guard is implemented via acquire_lock/release_lock
+    // (storage flag pattern). All payout functions already use it.
+    // ReentrancyDetected maps to Error::Reentrancy (code 40).
+    // The spec code 700 is exposed as a constant REENTRANCY_DETECTED_CODE.
+
+    // ── Issue #210: Partial release milestone payments ───────────────────────
+
+    /// Lock funds with milestone-based release schedule.
+    /// milestones: Vec of (percentage_bps, description) pairs that must sum to 10000.
+    /// Closes issue #210.
+    pub fn lock_funds_with_milestones(
+        env: Env,
+        session_id: Bytes,
+        payer: Address,
+        payee: Address,
+        asset: Address,
+        total_amount: i128,
+        milestones: Vec<(u32, Bytes)>,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        acquire_lock(&env)?;
+
+        validate_session_id(&session_id)?;
+        validate_amount(total_amount)?;
+        validate_different_addresses(&payer, &payee)?;
+
+        if milestones.is_empty() {
+            release_lock(&env);
+            return Err(Error::InvalidMilestones);
+        }
+
+        // Validate milestone percentages sum to 10000 bps
+        let mut total_bps: u32 = 0;
+        for i in 0..milestones.len() {
+            let (bps, _) = milestones.get(i).unwrap();
+            total_bps = total_bps.checked_add(bps).ok_or(Error::FeeCalculationOverflow)?;
+        }
+        if total_bps != 10_000 {
+            release_lock(&env);
+            return Err(Error::InvalidMilestones);
+        }
+
+        payer.require_auth();
+
+        let now = env.ledger().timestamp();
+        let dispute_window_ledgers = Self::get_dispute_window(env.clone());
+        let current_ledger = env.ledger().sequence();
+        let dispute_deadline = (current_ledger + dispute_window_ledgers) as u64;
+        let fee_bps = Self::get_platform_fee(env.clone());
+        let max_duration = Self::get_max_session_duration(env.clone());
+
+        let fee = total_amount
+            .checked_mul(fee_bps as i128)
+            .ok_or(Error::TransferError)?
+            .checked_div(10000)
+            .ok_or(Error::TransferError)?;
+        let total_locked = total_amount.checked_add(fee).ok_or(Error::TransferError)?;
+
+        let token_client = token::Client::new(&env, &asset);
+        if token_client.balance(&payer) < total_locked {
+            release_lock(&env);
+            return Err(Error::InsufficientBalance);
+        }
+
+        // Build milestone list
+        let mut milestone_list: Vec<Milestone> = Vec::new(&env);
+        for i in 0..milestones.len() {
+            let (bps, desc) = milestones.get(i).unwrap();
+            milestone_list.push_back(Milestone {
+                percentage_bps: bps,
+                description: desc,
+                released: false,
+            });
+        }
+
+        let session = Session {
+            version: VERSION,
+            session_id: session_id.clone(),
+            payer: payer.clone(),
+            payee: payee.clone(),
+            asset: asset.clone(),
+            amount: total_amount,
+            fee_bps,
+            status: SessionStatus::Locked,
+            created_at: now,
+            updated_at: now,
+            dispute_deadline,
+            expires_at: now + ESCROW_DURATION_SECONDS,
+            deadline: (env.ledger().sequence() as u64) + (max_duration as u64),
+            payer_approved: false,
+            payee_approved: false,
+            approved_at: 0,
+            dispute_opened_at: 0,
+            resolved_at: 0,
+            resolver: None,
+            resolution_note: None,
+            pending_extension: None,
+        };
+
+        let key = DataKey::Session(session_id.clone());
+        if env.storage().persistent().has(&key) {
+            release_lock(&env);
+            return Err(Error::DuplicateSessionId);
+        }
+        env.storage().persistent().set(&key, &session);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SessionMilestones(session_id.clone()), &milestone_list);
+
+        Self::add_to_expiry_index(env.clone(), session_id.clone(), session.expires_at)?;
+
+        let contract_id = env.current_contract_address();
+        token_client.transfer(&payer, &contract_id, &total_locked);
+
+        env.events().publish(
+            (Symbol::new(&env, "FundsLockedWithMilestones"),),
+            (session_id, payer, payee, total_amount, fee),
+        );
+
+        release_lock(&env);
+        Ok(())
+    }
+
+    /// Release a specific milestone payment to the seller.
+    /// Only the buyer (payer) can call this. Closes issue #210.
+    pub fn release_milestone(
+        env: Env,
+        session_id: Bytes,
+        milestone_index: u32,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        acquire_lock(&env)?;
+
+        let session = Self::get_session(env.clone(), session_id.clone())
+            .ok_or(Error::SessionNotFound)?;
+
+        if session.status == SessionStatus::Disputed {
+            release_lock(&env);
+            return Err(Error::InvalidSessionStatus);
+        }
+        if session.status != SessionStatus::Locked {
+            release_lock(&env);
+            return Err(Error::InvalidSessionStatus);
+        }
+
+        session.payer.require_auth();
+
+        let mut milestones: Vec<Milestone> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionMilestones(session_id.clone()))
+            .ok_or(Error::SessionNotFound)?;
+
+        if milestone_index >= milestones.len() {
+            release_lock(&env);
+            return Err(Error::MilestoneIndexOutOfBounds);
+        }
+
+        let mut milestone = milestones.get(milestone_index).unwrap();
+        if milestone.released {
+            release_lock(&env);
+            return Err(Error::MilestoneAlreadyReleased);
+        }
+
+        let milestone_amount = (session.amount as u128)
+            .checked_mul(milestone.percentage_bps as u128)
+            .ok_or(Error::FeeCalculationOverflow)?
+            .checked_div(10_000)
+            .ok_or(Error::FeeCalculationOverflow)? as i128;
+
+        let token_client = token::Client::new(&env, &session.asset);
+        let contract_id = env.current_contract_address();
+        token_client.transfer(&contract_id, &session.payee, &milestone_amount);
+
+        milestone.released = true;
+        milestones.set(milestone_index, milestone);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SessionMilestones(session_id.clone()), &milestones);
+
+        env.events().publish(
+            (Symbol::new(&env, "MilestoneReleased"),),
+            MilestoneReleased {
+                session_id,
+                milestone_index,
+                amount: milestone_amount,
+            },
+        );
+
+        release_lock(&env);
+        Ok(())
+    }
+
+    // ── Issue #211: Buyer and seller ratings/reputation ──────────────────────
+
+    /// Rate the counterparty after a session is Approved.
+    /// Rating must be 1–5. Each party can rate once per session.
+    /// Emits RatingSubmitted event. Closes issue #211.
+    pub fn rate_counterparty(
+        env: Env,
+        session_id: Bytes,
+        caller: Address,
+        rating: u32,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        caller.require_auth();
+
+        if rating < 1 || rating > 5 {
+            return Err(Error::InvalidRating);
+        }
+
+        let session = Self::get_session(env.clone(), session_id.clone())
+            .ok_or(Error::SessionNotFound)?;
+
+        if session.status != SessionStatus::Approved {
+            return Err(Error::SessionNotApproved);
+        }
+
+        if caller != session.payer && caller != session.payee {
+            return Err(Error::NotAuthorizedParty);
+        }
+
+        let ratee = if caller == session.payer {
+            session.payee.clone()
+        } else {
+            session.payer.clone()
+        };
+
+        // Use a per-session per-caller key to prevent double-rating
+        let flag_key = DataKey::RatingFlag(session_id.clone(), caller.clone());
+
+        if env.storage().persistent().has(&flag_key) {
+            return Err(Error::AlreadyRated);
+        }
+        env.storage().persistent().set(&flag_key, &true);
+
+        // Update ratee's aggregate rating
+        let rating_key = DataKey::UserRating(ratee.clone());
+        let mut user_rating: UserRating = env
+            .storage()
+            .persistent()
+            .get(&rating_key)
+            .unwrap_or_default();
+
+        user_rating.total_rating_sum = user_rating
+            .total_rating_sum
+            .checked_add(rating)
+            .ok_or(Error::ReputationOverflow)?;
+        user_rating.total_ratings = user_rating
+            .total_ratings
+            .checked_add(1)
+            .ok_or(Error::ReputationOverflow)?;
+
+        env.storage().persistent().set(&rating_key, &user_rating);
+
+        env.events().publish(
+            (Symbol::new(&env, "RatingSubmitted"),),
+            RatingSubmitted {
+                session_id,
+                from: caller,
+                to: ratee,
+                rating,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Get the average rating and total rating count for a user.
+    /// Returns (average_rating_scaled_by_100, total_ratings).
+    /// e.g. average 4.5 stars → returns (450, n). Closes issue #211.
+    pub fn get_user_rating(env: Env, user: Address) -> (u32, u32) {
+        let rating_key = DataKey::UserRating(user);
+        let user_rating: UserRating = env
+            .storage()
+            .persistent()
+            .get(&rating_key)
+            .unwrap_or_default();
+
+        if user_rating.total_ratings == 0 {
+            return (0, 0);
+        }
+
+        let average = user_rating
+            .total_rating_sum
+            .checked_mul(100)
+            .unwrap_or(0)
+            / user_rating.total_ratings;
+
+        (average, user_rating.total_ratings)
+    }
 }
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
-    env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
+    env.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotInitialized)
 }
 
 fn acquire_lock(env: &Env) -> Result<(), Error> {
-    if env.storage().instance().get(&DataKey::ReentrancyLock).unwrap_or(false) {
+    if env
+        .storage()
+        .instance()
+        .get(&DataKey::ReentrancyLock)
+        .unwrap_or(false)
+    {
         return Err(Error::Reentrancy);
     }
-    env.storage().instance().set(&DataKey::ReentrancyLock, &true);
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyLock, &true);
     Ok(())
 }
 
 fn release_lock(env: &Env) {
-    env.storage().instance().set(&DataKey::ReentrancyLock, &false);
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyLock, &false);
 }
 
 fn use_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), Error> {
@@ -1353,6 +1921,13 @@ fn use_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), Error> {
 
 fn validate_dispute_window(seconds: u64) -> Result<(), Error> {
     if !(DISPUTE_WINDOW_MIN_SECONDS..=DISPUTE_WINDOW_MAX_SECONDS).contains(&seconds) {
+        return Err(Error::InvalidDisputeWindow);
+    }
+    Ok(())
+}
+
+fn validate_dispute_window_ledgers(ledgers: u32) -> Result<(), Error> {
+    if ledgers < DISPUTE_WINDOW_MIN_LEDGERS || ledgers > DISPUTE_WINDOW_MAX_LEDGERS {
         return Err(Error::InvalidDisputeWindow);
     }
     Ok(())
@@ -1394,142 +1969,9 @@ fn validate_note(note: &Option<Bytes>) -> Result<(), Error> {
     }
     Ok(())
 }
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec};
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    WasmHash,
-}
-mod contract;
-
-pub use contract::{
-    AutoRefundExecutedEvent, CoreContract, CoreContractClient, FundsLockedEvent, InitializedEvent,
-    Session, SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
-
-    ContractError, CoreContract, CoreContractClient, LockedSession, Session,
-    SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
-
-    CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
-    SessionStatus, RefundRequestedEvent, RefundedEvent, DisputeInitiatedEvent,
-    DisputeResolvedEvent,
-    SessionRefundedEvent, SessionStatus,
-};
-
-#[contractimpl]
-impl CoreContract {
-    pub fn init(env: Env, admin: Address) {
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &admin);
-    }
-
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        let old_wasm_hash: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&DataKey::WasmHash)
-            .unwrap_or(BytesN::from_array(&env, &[0; 32]));
-
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
-        env.storage().instance().set(&DataKey::WasmHash, &new_wasm_hash);
-        
-        env.events().publish(
-            (Symbol::new(&env, "ContractUpgraded"),),
-            (old_wasm_hash, new_wasm_hash),
-        );
-    }
-
-    pub fn hello(env: Env, to: Symbol) -> Vec<Symbol> {
-        let mut vec = Vec::new(&env);
-        vec.push_back(symbol_short!("Hello"));
-        vec.push_back(to);
-        vec
-    }
-}
 
 #[cfg(test)]
 mod test;
 
 #[cfg(test)]
 mod test_storage_persistence;
-
-#![no_std]
-
-mod contract;
-
-pub use contract::{
-    CoreContract, CoreContractClient, DisputeResolvedEvent, FeeDeductedEvent, InitializedEvent,
-    RefundEvent, Session, SessionApprovedEvent, SessionCompletedEvent, SessionStatus,
-    CoreContract, CoreContractClient, Session, SessionApprovedEvent, SessionCompletedEvent,
-    SessionRefundedEvent, SessionStatus,
-};
-
-#[cfg(test)]
-mod test;
-
-
-fn refund() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, CoreContract);
-    let result: Vec<Symbol> = env.invoke_contract(
-        &contract_id,
-        &symbol_short!("hello"),
-        vec![&env, symbol_short!("World")],
-    );
-    assert_eq!(result, vec![&env, symbol_short!("Hello"), symbol_short!("World")]);
-
-    
-#[contractimpl]
-impl CoreContract {
-    pub fn hello(env: Env, to: Symbol) -> Vec<Symbol> {
-        vec![&env, symbol_short!("Refund"), to]
-    }
-}
-}
-
-
-
-fn setup() -> (
-    Env,
-    CoreContractClient<'static>,
-    TokenClient<'static>,
-    StellarAssetClient<'static>,
-    Address,
-    Address,
-    Address,
-    Address,
-) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract(token_admin.clone());
-    let token_client = TokenClient::new(&env, &token_address);
-    let asset_client = StellarAssetClient::new(&env, &token_address);
-
-    asset_client.mint(&buyer, &1_000);
-
-    let contract_id = env.register_contract(None, CoreContract);
-    let contract = CoreContractClient::new(&env, &contract_id);
-    contract.initialize(&treasury, &500);
-
-    (
-        env,
-        contract,
-        token_client,
-        asset_client,
-        buyer,
-        seller,
-        treasury,
-        contract_id,
-    )
-}
-

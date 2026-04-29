@@ -93,3 +93,12 @@ pub enum UpgradeError {
     /// Low-level upgrade failure.
     UpgradeFailed = 601,
 }
+
+/// Reentrancy protection error (issue #209).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ReentrancyError {
+    /// A reentrant call was detected. Code 700 per spec.
+    ReentrancyDetected = 700,
+}
